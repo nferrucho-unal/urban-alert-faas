@@ -1,0 +1,134 @@
+version: '3.8'
+
+services:
+  # Servidor de Mensajería AMQP Gestionado (RabbitMQ)
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: urban_alert_mq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=urban_user
+      - RABBITMQ_DEFAULT_PASS=urban_secure_pass
+
+  # NEW: Almacén Clave-Valor en Memoria (Simula Amazon ElastiCache Redis - ADR-04)
+  redis:
+    image: redis:7.2-alpine
+    container_name: urban_alert_cache
+    ports:
+      - "6379:6379"  # Puerto estándar de Redis
+    # Parámetros de Gobernanza (Página 30): Acceso restringido y persistencia básica opcional
+    command: redis-server --appendonly yes
+
+  # FaaS Notificaciones: Consume eventos con validación de idempotencia (QAS-02)
+  fn_notifications:
+    build: .
+    volumes:
+      - ./fn_notifications:/app
+    environment:
+      - BROKER_URL=amqp://urban_user:urban_secure_pass@rabbitmq:5672/%2F
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - rabbitmq
+      - redis
+    command: ["python", "app.py"]
+
+  # FaaS Auditoría: Registra eventos de forma idempotente (QAS-04.1)
+  fn_audit:
+    build: .
+    volumes:
+      - ./fn_audit:/app
+    environment:
+      - BROKER_URL=amqp://urban_user:urban_secure_pass@rabbitmq:5672/%2F
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - rabbitmq
+      - redis
+    command: ["python", "app.py"]
+
+  # FaaS Multimedia: Valida idempotencia al procesar imágenes (QAS-03)
+  fn_multimedia:
+    build: .
+    volumes:
+      - ./fn_multimedia:/app
+    environment:
+      - BROKER_URL=amqp://urban_user:urban_secure_pass@rabbitmq:5672/%2F
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - rabbitmq
+      - redis
+    command: ["python", "app.py"]
+
+  postgis_db:
+    image: postgis/postgis:16-3.4-alpine
+    container_name: urban_alert_gis_db
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=gis_admin
+      - POSTGRES_PASSWORD=gis_secure_pass
+      - POSTGRES_DB=urban_alert_geo
+    # Parámetro de Gobernanza (Pág 28, 30): Pool acotado a máximo 50 conexiones dedicadas a PostGIS
+    command: ["postgres", "-c", "max_connections=50"]
+    volumes:
+      - gis_data:/var/lib/postgresql/data
+      # Script automático para inicializar las tablas espaciales del mapa
+      - ./postgis_init:/docker-entrypoint-initdb.d
+  # 1. BASE DE DATOS CORE - PRIMARIA (Escritura y transacciones ACID - ADR-05)
+  # Simula la instancia principal de Amazon RDS (db.m5.large)
+  core_db_primary:
+    image: postgres:16-alpine
+    container_name: urban_alert_core_primary
+    user: postgres
+    ports:
+      - "5431:5432"  # Expuesta en el puerto 5431 del host para no chocar con PostGIS
+    environment:
+      - POSTGRES_USER=core_admin
+      - POSTGRES_PASSWORD=core_secure_pass
+      - POSTGRES_DB=urban_alert_core
+    # Parámetros de gobernanza para habilitar logs de replicación (WAL)
+    command: >
+      sh -c "
+      grep -q 'host replication core_admin' /var/lib/postgresql/data/pg_hba.conf || echo 'host replication core_admin 0.0.0.0/0 scram-sha-256' >> /var/lib/postgresql/data/pg_hba.conf;
+      exec postgres 
+      -c wal_level=replica 
+      -c max_wal_senders=5 
+      -c max_connections=100
+      "
+    volumes:
+      - core_primary_data:/var/lib/postgresql/data
+      - ./core_init:/docker-entrypoint-initdb.d
+
+  # 2. BASE DE DATOS CORE - RÉPLICA STANDBY (Redundancia Activa - QAS-06)
+  # Simula la instancia Multi-AZ de AWS lista para promoción automática
+  core_db_replica:
+    image: postgres:16-alpine
+    container_name: urban_alert_core_replica
+    ports:
+      - "5433:5432"  # Expuesta en el puerto 5433 del host
+    environment:
+      - POSTGRES_USER=core_admin
+      - POSTGRES_PASSWORD=core_secure_pass
+      - POSTGRES_DB=urban_alert_core
+      - PGPASSWORD=core_secure_pass
+    depends_on:
+      - core_db_primary
+    # Comando para iniciar en modo de solo lectura (hot_standby) y apuntar a la primaria
+    command: >
+      sh -c "
+      until pg_isready -h core_db_primary -p 5432; do echo waiting for primary; sleep 1; done;
+      if [ ! -s /var/lib/postgresql/data/PG_VERSION ]; then
+        pg_basebackup -h core_db_primary -D /var/lib/postgresql/data -U core_admin -Fp -Xs -R;
+      fi;
+      chown -R postgres:postgres /var/lib/postgresql/data;
+      chmod 700 /var/lib/postgresql/data;
+      exec su-exec postgres postgres -c hot_standby=on
+      "
+    volumes:
+      - core_replica_data:/var/lib/postgresql/data
+      
+volumes:
+  gis_data:
+  core_primary_data:
+  core_replica_data:

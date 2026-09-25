@@ -1,0 +1,156 @@
+version: '3.8'
+
+services:
+  # 1. SERVIDOR DE MENSAJERÍA AMQP (RabbitMQ)
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: urban_alert_mq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=urban_user
+      - RABBITMQ_DEFAULT_PASS=urban_secure_pass
+    # Sonda de salud de infraestructura: Verifica que el broker acepte conexiones
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s    # Cada cuánto tiempo evalúa
+      timeout: 5s     # Tiempo máximo de espera de respuesta
+      retries: 3      # Intentos permitidos antes de marcar 'unhealthy'
+      start_period: 15s # Ventana inicial de gracia para el arranque del servicio
+
+  # 2. ALMACÉN CLAVE-VALOR EN MEMORIA (Redis)
+  redis:
+    image: redis:7.2-alpine
+    container_name: urban_alert_cache
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # 3. BASE DE DATOS CORE - PRIMARIA
+  core_db_primary:
+    image: postgres:16-alpine
+    container_name: urban_alert_core_primary
+    ports:
+      - "5431:5432"
+    environment:
+      - POSTGRES_USER=core_admin
+      - POSTGRES_PASSWORD=core_secure_pass
+      - POSTGRES_DB=urban_alert_core
+    command: >
+      postgres 
+      -c wal_level=replica 
+      -c max_wal_senders=5 
+      -c max_connections=100
+    volumes:
+      - core_primary_data:/var/lib/postgresql/data
+      - ./core_init:/docker-entrypoint-initdb.d
+    # Sonda que garantiza que la base transaccional esté lista para recibir conexiones SQL
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U core_admin -d urban_alert_core"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # 4. BASE DE DATOS CORE - RÉPLICA STANDBY (Redundancia Activa - QAS-06)
+  core_db_replica:
+    image: postgres:16-alpine
+    container_name: urban_alert_core_replica
+    ports:
+      - "5433:5432"
+    environment:
+      - POSTGRES_USER=core_admin
+      - POSTGRES_PASSWORD=core_secure_pass
+      - POSTGRES_DB=urban_alert_core
+    # Dependencia estricta de la condición de salud (No arranca hasta que la primaria esté 'healthy')
+    depends_on:
+      core_db_primary:
+        condition: service_healthy
+    command: >
+      sh -c "
+      until pg_isready -h core_db_primary -p 5432; do echo waiting for primary; sleep 1; done;
+      if [ ! -s /var/lib/postgresql/data/PG_VERSION ]; then
+        pg_basebackup -h core_db_primary -D /var/lib/postgresql/data -U core_admin -Fp -Xs -R;
+      fi;
+      exec postgres -c hot_standby=on
+      "
+    volumes:
+      - core_replica_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U core_admin -d urban_alert_core"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # 5. MOTOR DE BASE DE DATOS GEOESPACIAL AISLADO (PostGIS - QAS-05)
+  postgis_db:
+    image: postgis/postgis:16-3.4-alpine
+    container_name: urban_alert_gis_db
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=gis_admin
+      - POSTGRES_PASSWORD=gis_secure_pass
+      - POSTGRES_DB=urban_alert_geo
+    command: ["postgres", "-c", "max_connections=50"]
+    volumes:
+      - gis_data:/var/lib/postgresql/data
+      - ./postgis_init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gis_admin -d urban_alert_geo"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # =========================================================================
+  # SERVICIOS DE CÓMPUTO FAAS (Consumidores Asíncronos con auto-recuperación)
+  # =========================================================================
+
+  fn_notifications:
+    build: .
+    restart: always  # TÁCTICA DE RECUPERACIÓN: Si el contenedor muere o cae, Docker lo levanta solo
+    volumes:
+      - ./fn_notifications:/app
+    environment:
+      - BROKER_URL=amqp://urban_user:urban_secure_pass@rabbitmq:5672//
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  fn_audit:
+    build: .
+    restart: always
+    volumes:
+      - ./fn_audit:/app
+    environment:
+      - BROKER_URL=amqp://urban_user:urban_secure_pass@rabbitmq:5672//
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  fn_multimedia:
+    build: .
+    restart: always
+    volumes:
+      - ./fn_multimedia:/app
+    environment:
+      - BROKER_URL=amqp://urban_user:urban_secure_pass@rabbitmq:5672//
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  gis_data:
+  core_primary_data:
+  core_replica_data:
