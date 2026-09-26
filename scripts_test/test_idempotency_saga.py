@@ -1,6 +1,7 @@
 import pika
 import json
 import time
+import uuid
 
 BROKER_LOCAL = "amqp://urban_user:urban_secure_pass@localhost:5672/%2F"
 
@@ -13,7 +14,7 @@ def probar_ataque_duplicados():
     
     report_id = "REP-2026-BOGOTA-1001"
     # ID único de correlación compartido para simular el duplicado exacto del bus de eventos
-    correlation_id_compartido = "id-unico-de-mensaje-transaccional-001"
+    correlation_id_compartido = f"idempotency-{uuid.uuid4()}"
     
     payload = {
         "reportId": report_id,

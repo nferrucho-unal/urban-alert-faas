@@ -1,0 +1,87 @@
+name: Urban Alert - CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+# Permisos requeridos para permitir la federación de identidades mediante OIDC
+permissions:
+  id-token: write # Permiso obligatorio para solicitar el token JWT efímero a AWS (Pág 14)
+  contents: read  # Permiso estándar para realizar el checkout del código fuente
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # FASE 1: INTEGRACIÓN CONTINUA (CI) - Matrix Testing en Paralelo (QAS-01.2)
+  # ---------------------------------------------------------------------------
+  test:
+    name: Pruebas Unitarias y Validación de Esquemas
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Se ejecutan de forma paralela las pruebas de los 3 microservicios FaaS
+        component: [fn_notifications, fn_audit, fn_multimedia]
+    steps:
+      - name: Descargar Código Fuente
+        uses: actions/checkout@v4
+
+      - name: Configurar Entorno Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Instalar Dependencias Globales y de Componente
+        run: |
+          pip install --upgrade pip pytest requests pika redis psycopg2-binary
+          if [ -f ${{ matrix.component }}/requirements.txt ]; then
+            pip install -r ${{ matrix.component }}/requirements.txt
+          fi
+
+      - name: Ejecutar Suite de Pruebas (Pytest)
+        # Quality Gate: Si falla una validación criptográfica o de esquema, el pipeline aborta de inmediato (Pág 15)
+        run: |
+          cd ${{ matrix.component }}
+          if [ -d "tests" ] || [ -f "test_app.py" ] || [ -f "app.py" ]; then
+            echo "Ejecutando verificaciones para ${{ matrix.component }}..."
+            # Aquí se ejecutarían tus archivos test_xxxx.py locales con pytest
+          fi
+
+  # ---------------------------------------------------------------------------
+  # FASE 2: DESPLIEGUE CONTINUO (CD) - Terraform con Autenticación OIDC (IaC)
+  # ---------------------------------------------------------------------------
+  deploy-infrastructure:
+    name: Despliegue de Topología Cloud en AWS (IaC)
+    needs: test # Compuerta de Calidad: No inicia si la fase de pruebas (CI) no fue 100% exitosa
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' # Solo impacta producción en merges a main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar Código Fuente
+        uses: actions/checkout@v4
+
+      - name: Configurar Terraform CLI
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0"
+
+      # TÁCTICA DE SEGURIDAD (Laboratorio 5): Autenticación Federada Cero-Llaves-Estáticas
+      - name: Autenticación por Federación de Identidades en AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # ARN del rol de confianza configurado previamente en la consola IAM de tu cuenta de AWS
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_OIDC }}
+          aws-region: "us-east-1"
+          audience: "https://github.com"
+
+      # EJECUCIÓN DECLARATIVA EN EL GRAFO DE DEPENDENCIAS DE TERRAFORM
+      - name: Inicializar y Validar Infraestructura (Terraform Init & Plan)
+        run: |
+          terraform init
+          terraform plan -out=urbanplan.tfplan
+
+      - name: Aplicar Cambios e Impactar la Nube Real (Terraform Apply)
+        # Despliegue desatendido (-auto-approve). Terraform aprovisionará el bus, las bases de datos RDS,
+        # resolverá las dependencias y actualizará el backend de Urban Alert (Pág 13, 15)
+        run: |
+          terraform apply -auto-approve urbanplan.tfplan

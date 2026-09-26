@@ -21,6 +21,21 @@ services:
     # Parámetros de Gobernanza (Página 30): Acceso restringido y persistencia básica opcional
     command: redis-server --appendonly yes
 
+  mongodb:
+    image: mongo:7.0
+    container_name: urban_alert_nosql
+    ports:
+      - "127.0.0.1:27017:27017"
+    environment:
+      - MONGO_INITDB_DATABASE=urban_alert_media
+    volumes:
+      - multimedia_metadata:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   # FaaS Notificaciones: Consume eventos con validación de idempotencia (QAS-02)
   fn_notifications:
     build: .
@@ -54,10 +69,11 @@ services:
       - ./fn_multimedia:/app
     environment:
       - BROKER_URL=amqp://urban_user:urban_secure_pass@rabbitmq:5672/%2F
-      - REDIS_URL=redis://redis:6379/0
+      - MONGO_URL=mongodb://mongodb:27017
+      - MONGO_DATABASE=urban_alert_media
     depends_on:
       - rabbitmq
-      - redis
+      - mongodb
     command: ["python", "app.py"]
 
   postgis_db:
@@ -132,3 +148,4 @@ volumes:
   gis_data:
   core_primary_data:
   core_replica_data:
+  multimedia_metadata:

@@ -3,10 +3,11 @@ import os
 import sys
 import threading
 import time
+import uuid
 import pika
 
 # Parámetros de conexión AMQP
-BROKER_LOCAL = "amqp://urban_user:urban_secure_pass@localhost:5672//"
+BROKER_LOCAL = "amqp://urban_user:urban_secure_pass@localhost:5672/%2F"
 EXCHANGE_NAME = "urban_alert_events"
 
 # Configuración del Stress Test (QAS-03: Picos 10x de carga en una ráfaga masiva)
@@ -79,7 +80,7 @@ def ejecutar_stress_test():
 
     num_workers = 10  # Dividir la carga en 10 hilos concurrentes
     eventos_per_worker_seg = EVENTOS_POR_SEGUNDO // num_workers
-    correlation_base = "trace-stress-2026"
+    correlation_base = f"trace-stress-{uuid.uuid4().hex}"
 
     start_time_global = time.time()
 

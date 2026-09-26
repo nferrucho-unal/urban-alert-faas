@@ -1,9 +1,11 @@
 import pika
 import json
+import uuid
 
 BROKER_LOCAL = "amqp://urban_user:urban_secure_pass@localhost:5672/%2F"
 
 def disparar_evento_prueba_dlq():
+    run_id = uuid.uuid4().hex
     params = pika.URLParameters(BROKER_LOCAL)
     connection = pika.BlockingConnection(params)
     channel = connection.channel()
@@ -20,7 +22,7 @@ def disparar_evento_prueba_dlq():
         }
         
         propiedades = pika.BasicProperties(
-            correlation_id=f"traza-dlq-test-{i}",
+            correlation_id=f"traza-dlq-test-{run_id}-{i}",
             content_type="application/json"
         )
         

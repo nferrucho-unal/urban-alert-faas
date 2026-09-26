@@ -20,7 +20,7 @@ python -m venv env
 python -m pip install -r requirements.txt
 ```
 
-Las dependencias principales son Flask, `pika`, Redis y `psycopg2-binary`.
+Las dependencias principales son `pika`, Redis, PyMongo y `psycopg2-binary`.
 
 Estructura funcional:
 
@@ -32,8 +32,9 @@ urban-alert-faas/
 ├── core_init/                 # Esquema y permisos de la base Core
 ├── postgis_init/              # Inicialización de la base geoespacial
 ├── fn_audit/                  # Auditoría y hash chaining
-├── fn_notificaction/          # Idempotencia y DLQ
+├── fn_notifications/          # Consumidor AMQP, idempotencia Redis y DLQ
 ├── fn_multimedia/             # Procesamiento multimedia
+├── MongoDB                    # Metadata multimedia NoSQL
 └── scripts_test/              # Scripts de validación y estrés
 ```
 
@@ -58,6 +59,7 @@ Puertos locales principales:
 | RabbitMQ AMQP | `5672` |
 | RabbitMQ Management | `15672` |
 | Redis | `6379` |
+| MongoDB local | `27017` (solo loopback) |
 | PostGIS | `5432` |
 | Core primaria | `5431` |
 | Core réplica | `5433` |
@@ -99,6 +101,8 @@ Con los servicios levantados y el entorno virtual activo, ejecuta los scripts de
 ```powershell
 python .\scripts_test\publicar_evento_saga.py
 python .\scripts_test\test_idempotency_saga.py
+python .\scripts_test\test_multimedia_nosql.py
+python .\scripts_test\test_notifications_redis.py
 python .\scripts_test\test_dlq_routing.py
 python .\scripts_test\verify_core_replication.py
 ```
@@ -107,6 +111,8 @@ Cada script valida un comportamiento distinto:
 
 - `publicar_evento_saga.py`: flujo feliz de la saga y propagación de eventos.
 - `test_idempotency_saga.py`: detección de un mensaje duplicado mediante Redis.
+- `test_multimedia_nosql.py`: publica un evento multimedia y verifica su metadata en MongoDB.
+- `test_notifications_redis.py`: publica un reporte y valida idempotencia/estado con TTL en Redis.
 - `test_dlq_routing.py`: publicación de eventos para validar el enrutamiento a DLQ.
 - `verify_core_replication.py`: escritura en la primaria, lectura en la réplica y bloqueo de escrituras en standby.
 

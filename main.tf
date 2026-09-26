@@ -1,7 +1,6 @@
-# =========================================================================
-# 1. CONFIGURACIÓN DEL PROVEEDOR (AWS)
-# =========================================================================
 terraform {
+  required_version = ">= 1.5.0"
+
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -11,204 +10,281 @@ terraform {
 }
 
 provider "aws" {
-  region = "us-east-1" # Región de referencia declarada en el documento
+  region = var.aws_region
 }
 
-# =========================================================================
-# 2. PROVEEDOR DE MENSAJERÍA - AMAZON MQ (ADR-01: RabbitMQ gestionado)
-# =========================================================================
-resource "aws_mq_broker" "urban_alert_mq" {
-  broker_name        = "urban-alert-mq-cluster"
-  engine_type        = "RabbitMQ"
-  engine_version     = "3.13" # Alineado con la versión local probada
-  host_instance_type = "mq.m5.large"
-  deployment_mode    = "CLUSTER_MULTI_AZ" # Gobernanza: 3 Nodos distribuidos (Pág 27, 31)
+variable "aws_region" {
+  type        = string
+  description = "AWS region for Urban Alert."
+  default     = "us-east-1"
+}
 
-  user {
-    username = "urban_user"
-    password = "urban_secure_password_cloud_2026" # Reemplazar por secretos en prod
+variable "core_backend_image" {
+  type        = string
+  description = "Public ECR image for the Core API service."
+  default     = "public.ecr.aws/urban-alert/core-backend:latest"
+}
+
+variable "database_primary_url" {
+  type        = string
+  sensitive   = true
+  description = "Connection URL for the Core PostgreSQL primary. Supply through a secure tfvars/CI secret."
+}
+
+variable "redis_host" {
+  type        = string
+  description = "Primary Redis endpoint used by the Core API."
+}
+
+variable "rabbitmq_url" {
+  type        = string
+  sensitive   = true
+  description = "AMQP connection URL used by the Core API to publish domain events."
+}
+
+variable "core_vpc_connector_arn" {
+  type        = string
+  description = "App Runner VPC Connector ARN with egress access to Core PostgreSQL, Redis, and Amazon MQ."
+}
+
+variable "waf_rate_limit_per_five_minutes" {
+  type        = number
+  description = "Maximum requests per client IP in the AWS WAF rolling five-minute window."
+  default     = 30000
+}
+
+resource "aws_cognito_user_pool" "urban_alert_identity" {
+  name                     = "urban-alert-users"
+  username_attributes      = ["email"]
+  auto_verified_attributes = ["email"]
+  mfa_configuration        = "OFF"
+
+  password_policy {
+    minimum_length                   = 12
+    require_lowercase                = true
+    require_numbers                  = true
+    require_symbols                  = true
+    require_uppercase                = true
+    temporary_password_validity_days = 7
   }
 }
 
-# =========================================================================
-# 3. CACHÉ E IDEMPOTENCIA - AMAZON ELASTICACHE (ADR-04: Redis con Failover)
-# =========================================================================
-resource "aws_elasticache_replication_group" "urban_alert_cache" {
-  replication_group_id       = "urban-alert-redis-group"
-  description                = "Almacen de sesion, cache de mapas e idempotencia 24h"
-  node_type                  = "cache.t4g.medium"
-  num_cache_clusters         = 2 # Failover automático con réplica (Pág 28, 30)
-  parameter_group_name       = "default.redis7"
-  port                       = 6379
-  automatic_failover_enabled = true
+resource "aws_cognito_user_pool_client" "urban_alert_api" {
+  name                                 = "urban-alert-api-client"
+  user_pool_id                         = aws_cognito_user_pool.urban_alert_identity.id
+  generate_secret                      = false
+  explicit_auth_flows                  = ["ALLOW_USER_SRP_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"]
+  prevent_user_existence_errors        = "ENABLED"
+  enable_token_revocation              = true
+  enable_propagate_additional_user_context_data = false
 }
 
-# =========================================================================
-# 4. BASE DE DATOS CORE - AMAZON RDS MULTI-AZ (ADR-05: Redundancia Activa)
-# =========================================================================
-resource "aws_db_instance" "core_db" {
-  identifier             = "urban-alert-core-db"
-  allocated_storage      = 20
-  max_allocated_storage  = 100 # Gobernanza: Almacenamiento con auto-escalado (Pág 30)
-  engine                 = "postgres"
-  engine_version         = "16"
-  instance_class         = "db.m5.large" # Instancia dedicada exigida en el ADR-05
-  db_name                = "urban_alert_core"
-  username               = "core_admin"
-  password               = "core_secure_pass_cloud"
-  skip_final_snapshot    = true
-  
-  # QAS-06: Redundancia Activa mediante réplica en caliente Multi-AZ gestionada
-  multi_az               = true 
-  storage_encrypted      = true # Cifrado KMS en reposo obligatorio (Pág 28, 29)
-}
+resource "aws_apprunner_service" "core_app_runner" {
+  service_name = "urban-alert-core-service"
 
-# =========================================================================
-# 5. BASE DE DATOS GEOESPACIAL AISLADA - POSTGRES + POSTGIS (QAS-05: Bulkhead)
-# =========================================================================
-resource "aws_db_instance" "gis_db" {
-  identifier            = "urban-alert-gis-db"
-  allocated_storage     = 20
-  engine                = "postgres"
-  engine_version        = "16"
-  instance_class        = "db.t4g.medium" # Instancia e infraestructura aislada del Core
-  db_name               = "urban_alert_geo"
-  username              = "gis_admin"
-  password              = "gis_secure_pass_cloud"
-  skip_final_snapshot   = true
-  
-  # Aislamiento estructural: Las consultas al mapa no tocan la instancia core_db
-}
+  source_configuration {
+    image_repository {
+      image_identifier      = var.core_backend_image
+      image_repository_type = "ECR_PUBLIC"
 
-# =========================================================================
-# 6. CAPA DE CÓMPUTO FAAS - AWS LAMBDA (Servicio de Notificaciones - QAS-02)
-# =========================================================================
+      runtime_environment_variables = {
+        REDIS_HOST              = var.redis_host
+        DATABASE_PRIMARY_URL    = var.database_primary_url
+        BROKER_URL              = var.rabbitmq_url
+        REQUEST_TIMEOUT_SECONDS = "10.0"
+      }
+    }
 
-# Rol IAM restrictivo para la Lambda (Gobernanza: Solo envíos, sin acceso extra - Pág 29)
-resource "aws_iam_role" "lambda_notifications_role" {
-  name = "urban-alert-notifications-lambda-role"
+    auto_deployments_enabled = true
+  }
 
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action    = "sts:AssumeRole"
-      Effect    = "Allow"
-      Principal = { Service = "://amazonaws.com" }
-    }]
-  })
-}
+  instance_configuration {
+    cpu    = "1 vCPU"
+    memory = "2 GB"
+  }
 
-# Compresión automática del código fuente local de la función
-data "archive_file" "notifications_zip" {
-  type        = "zip"
-  source_dir  = "${path.module}/fn_notifications"
-  output_path = "${path.module}/fn_notifications.zip"
-}
-
-resource "aws_lambda_function" "fn_notifications" {
-  filename         = data.archive_file.notifications_zip.output_path
-  function_name    = "UrbanAlert_FaaS_Notifications"
-  role             = aws_iam_role.lambda_notifications_role.arn
-  handler          = "app.callback_notificaciones" # Archivo.Función manejadora
-  runtime          = "python3.12"
-  
-  # Gobernanza técnica estricta (Página 27, 29):
-  memory_size      = 256  # Rango permitido: 256–512 MB
-  timeout          = 10   # Timeout de 10s ante caídas de terceros
-
-  environment {
-    variables = {
-      BROKER_URL = "amqps://${aws_mq_broker.urban_alert_mq.user[0].username}:${aws_mq_broker.urban_alert_mq.user[0].password}@${aws_mq_broker.urban_alert_mq.instances[0].endpoint}"
-      REDIS_URL  = "redis://${aws_elasticache_replication_group.urban_alert_cache.primary_endpoint_address}:6379/0"
+  network_configuration {
+    egress_configuration {
+      egress_type       = "VPC"
+      vpc_connector_arn = var.core_vpc_connector_arn
     }
   }
 }
 
-# =========================================================================
-# 7. SERVICIO FAAS DE AUDITORÍA (QAS-04.1 & QAS-04.2)
-# =========================================================================
+resource "aws_api_gateway_rest_api" "urban_alert" {
+  name        = "urban-alert-public-api"
+  description = "Authenticated public ingress for the Urban Alert Core API."
 
-# Rol IAM restrictivo para la Lambda de Auditoría (Gobernanza: Permiso Append-Only)
-resource "aws_iam_role" "lambda_audit_role" {
-  name = "urban-alert-audit-lambda-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action    = "sts:AssumeRole"
-      Effect    = "Allow"
-      Principal = { Service = "://amazonaws.com" }
-    }]
-  })
-}
-
-# Empaquetado automático del código fuente local de Auditoría
-data "archive_file" "audit_zip" {
-  type        = "zip"
-  source_dir  = "${path.module}/fn_audit"
-  output_path = "${path.module}/fn_audit.zip"
-}
-
-# Definición de la Función Lambda de Auditoría
-resource "aws_lambda_function" "fn_audit" {
-  filename         = data.archive_file.audit_zip.output_path
-  function_name    = "UrbanAlert_FaaS_Audit"
-  role             = aws_iam_role.lambda_audit_role.arn
-  handler          = "app.callback_auditoria" # Archivo.Función
-  runtime          = "python3.12"
-  
-  # Parámetros de Gobernanza (Página 29):
-  memory_size      = 256  # Configuración rígida de 256 MB
-  timeout          = 5    # Timeout ajustado a 5s por evento
-
-  environment {
-    variables = {
-      BROKER_URL = "amqps://${aws_mq_broker.urban_alert_mq.user.username}:${aws_mq_broker.urban_alert_mq.user.password}@${aws_mq_broker.urban_alert_mq.instances.endpoint}"
-      REDIS_URL  = "redis://${aws_elasticache_replication_group.urban_alert_cache.primary_endpoint_address}:6379/0"
-    }
+  endpoint_configuration {
+    types = ["REGIONAL"]
   }
 }
 
-# =========================================================================
-# 8. SERVICIO FAAS MULTIMEDIA (QAS-03 & QAS-08: Procesamiento de Imágenes)
-# =========================================================================
-
-# Rol IAM para la Lambda Multimedia
-resource "aws_iam_role" "lambda_multimedia_role" {
-  name = "urban-alert-multimedia-lambda-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action    = "sts:AssumeRole"
-      Effect    = "Allow"
-      Principal = { Service = "://amazonaws.com" }
-    }]
-  })
+resource "aws_api_gateway_authorizer" "cognito_jwt" {
+  name            = "urban-alert-cognito-authorizer"
+  rest_api_id     = aws_api_gateway_rest_api.urban_alert.id
+  type            = "COGNITO_USER_POOLS"
+  provider_arns   = [aws_cognito_user_pool.urban_alert_identity.arn]
+  identity_source = "method.request.header.Authorization"
 }
 
-# Empaquetado automático del código fuente local Multimedia
-data "archive_file" "multimedia_zip" {
-  type        = "zip"
-  source_dir  = "${path.module}/fn_multimedia"
-  output_path = "${path.module}/fn_multimedia.zip"
+resource "aws_api_gateway_resource" "proxy" {
+  rest_api_id = aws_api_gateway_rest_api.urban_alert.id
+  parent_id   = aws_api_gateway_rest_api.urban_alert.root_resource_id
+  path_part   = "{proxy+}"
 }
 
-# Definición de la Función Lambda Multimedia
-resource "aws_lambda_function" "fn_multimedia" {
-  filename         = data.archive_file.multimedia_zip.output_path
-  function_name    = "UrbanAlert_FaaS_Multimedia"
-  role             = aws_iam_role.lambda_multimedia_role.arn
-  handler          = "app.callback_multimedia" # Archivo.Función
-  runtime          = "python3.12"
-  
-  # Parámetros de Gobernanza (Página 30):
-  memory_size      = 512  # Requiere más cómputo (512 MB) para procesamiento EXIF y miniaturas
-  timeout          = 15   # Timeout de 15s para absorber latencias de manipulación binaria
+resource "aws_api_gateway_method" "root" {
+  rest_api_id   = aws_api_gateway_rest_api.urban_alert.id
+  resource_id   = aws_api_gateway_rest_api.urban_alert.root_resource_id
+  http_method   = "ANY"
+  authorization = "COGNITO_USER_POOLS"
+  authorizer_id = aws_api_gateway_authorizer.cognito_jwt.id
+}
 
-  environment {
-    variables = {
-      BROKER_URL = "amqps://${aws_mq_broker.urban_alert_mq.user.username}:${aws_mq_broker.urban_alert_mq.user.password}@${aws_mq_broker.urban_alert_mq.instances.endpoint}"
+resource "aws_api_gateway_integration" "root" {
+  rest_api_id             = aws_api_gateway_rest_api.urban_alert.id
+  resource_id             = aws_api_gateway_rest_api.urban_alert.root_resource_id
+  http_method             = aws_api_gateway_method.root.http_method
+  integration_http_method = "ANY"
+  type                    = "HTTP_PROXY"
+  uri                     = "https://${aws_apprunner_service.core_app_runner.service_url}/"
+}
+
+resource "aws_api_gateway_method" "proxy" {
+  rest_api_id   = aws_api_gateway_rest_api.urban_alert.id
+  resource_id   = aws_api_gateway_resource.proxy.id
+  http_method   = "ANY"
+  authorization = "COGNITO_USER_POOLS"
+  authorizer_id = aws_api_gateway_authorizer.cognito_jwt.id
+
+  request_parameters = {
+    "method.request.path.proxy" = true
+  }
+}
+
+resource "aws_api_gateway_integration" "proxy" {
+  rest_api_id             = aws_api_gateway_rest_api.urban_alert.id
+  resource_id             = aws_api_gateway_resource.proxy.id
+  http_method             = aws_api_gateway_method.proxy.http_method
+  integration_http_method = "ANY"
+  type                    = "HTTP_PROXY"
+  uri                     = "https://${aws_apprunner_service.core_app_runner.service_url}/{proxy}"
+
+  request_parameters = {
+    "integration.request.path.proxy" = "method.request.path.proxy"
+  }
+}
+
+resource "aws_api_gateway_deployment" "urban_alert" {
+  rest_api_id = aws_api_gateway_rest_api.urban_alert.id
+
+  triggers = {
+    redeployment = sha1(jsonencode([
+      aws_api_gateway_method.root.id,
+      aws_api_gateway_integration.root.id,
+      aws_api_gateway_method.proxy.id,
+      aws_api_gateway_integration.proxy.id,
+      aws_api_gateway_authorizer.cognito_jwt.id,
+    ]))
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_api_gateway_stage" "urban_alert" {
+  rest_api_id   = aws_api_gateway_rest_api.urban_alert.id
+  deployment_id = aws_api_gateway_deployment.urban_alert.id
+  stage_name    = "prod"
+}
+
+resource "aws_api_gateway_method_settings" "throttling" {
+  rest_api_id = aws_api_gateway_rest_api.urban_alert.id
+  stage_name  = aws_api_gateway_stage.urban_alert.stage_name
+  method_path = "*/*"
+
+  settings {
+    throttling_rate_limit  = 100
+    throttling_burst_limit = 200
+    metrics_enabled        = true
+  }
+}
+
+resource "aws_wafv2_web_acl" "urban_alert" {
+  name  = "urban-alert-api-waf"
+  scope = "REGIONAL"
+
+  default_action {
+    allow {}
+  }
+
+  rule {
+    name     = "rate-limit-by-client-ip"
+    priority = 0
+
+    action {
+      block {}
+    }
+
+    statement {
+      rate_based_statement {
+        limit              = var.waf_rate_limit_per_five_minutes
+        aggregate_key_type = "IP"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "urban-alert-rate-limit"
+      sampled_requests_enabled   = true
     }
   }
+
+  rule {
+    name     = "aws-managed-common-rules"
+    priority = 1
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesCommonRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "urban-alert-common-rules"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  visibility_config {
+    cloudwatch_metrics_enabled = true
+    metric_name                = "urban-alert-api-waf"
+    sampled_requests_enabled   = true
+  }
+}
+
+resource "aws_wafv2_web_acl_association" "urban_alert_api" {
+  resource_arn = aws_api_gateway_stage.urban_alert.arn
+  web_acl_arn  = aws_wafv2_web_acl.urban_alert.arn
+}
+
+output "urban_alert_api_url" {
+  description = "Public API Gateway URL; use this endpoint for client traffic."
+  value       = aws_api_gateway_stage.urban_alert.invoke_url
+}
+
+output "urban_alert_cognito_user_pool_id" {
+  value = aws_cognito_user_pool.urban_alert_identity.id
+}
+
+output "urban_alert_cognito_client_id" {
+  value = aws_cognito_user_pool_client.urban_alert_api.id
 }

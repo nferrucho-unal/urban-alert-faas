@@ -45,7 +45,8 @@ Flask==3.0.3
 requests==2.32.3
 pika==1.3.2
 redis==5.0.4
-psycopg2-binary==2.9.9
+psycopg2-binary==2.9.11
+pymongo==4.10.1
 ```
 
 ---
@@ -65,7 +66,7 @@ La topología implementa sondas de disponibilidad rígidas. Puede verificar que 
 ```bash
 docker compose ps
 ```
-*Los servicios de cómputo esperarán de forma automática a que RabbitMQ, Redis y la base de datos primaria reporten un estado `(healthy)` antes de iniciar sus escuchas.*
+*Notificaciones espera a RabbitMQ y Redis; Multimedia espera a RabbitMQ y MongoDB. Los servicios que usan Core/PostGIS mantienen sus dependencias propias.*
 
 ---
 
@@ -96,6 +97,12 @@ Inyecta un evento original y acto seguido envía un duplicado exacto con el mism
 python scripts_test/test_idempotency_saga.py
 ```
 
+### Verificación de registro de notificación en Redis
+Confirma que el consumidor guarda el estado e idempotencia con TTL y no vuelve a procesar el mismo evento.
+```bash
+python scripts_test/test_notifications_redis.py
+```
+
 ### Escenario C: Tolerancia a Fallos y Enrutamiento Automático a la DLQ (ADR-02)
 Genera reportes diseñados para simular la caída del proveedor externo de mensajería (SMS/Push). Valida en la consola de administración de RabbitMQ (`http://localhost:15672`) que los mensajes sean desviados de forma automática hacia la cola de fallos `q_dead_letter_notifications` tras agotar los 3 intentos.
 ```bash
@@ -109,6 +116,12 @@ python scripts_test/verify_core_replication.py
 ```
 
 ---
+
+### Escenario E: Persistencia multimedia desacoplada (QAS-03)
+Publica un evento `multimedia.upload` y espera la metadata del objeto en MongoDB. El archivo queda en Object Storage y el consumidor no escribe directamente en PostgreSQL/PostGIS.
+```bash
+python scripts_test/test_multimedia_nosql.py
+```
 
 ## 5. LABORATORIO DE ESTRÉS CONCURRENTE (PÍCOS 10X - QAS-03)
 
