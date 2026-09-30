@@ -30,6 +30,7 @@ urban-alert-faas/
 ├── Dockerfile
 ├── requirements.txt
 ├── core_init/                 # Esquema y permisos de la base Core
+├── audit_init/                # Event Store PostgreSQL append-only
 ├── core_services/             # APIs de Reportes, Usuarios, Obras y Geoespacial
 ├── postgis_init/              # Inicialización de la base geoespacial
 ├── fn_audit/                  # Auditoría y hash chaining
@@ -77,6 +78,13 @@ Puertos locales principales:
 Compose aplica `core_init/002_business_services.sql` y
 `postgis_init/002_reportes_geo.sql` con tareas idempotentes antes de iniciar
 las APIs. No es necesario borrar los volúmenes para actualizar el esquema.
+Auditoría conserva los eventos en `audit_db`, PostgreSQL dedicada con volumen
+persistente `audit_data`. `audit_events` es append-only, deduplica por `eventId`
+y mantiene la cadena de hashes aunque el consumidor se reinicie.
+Auditoría conserva sus eventos en PostgreSQL dedicado (`audit_db`) sobre el
+volumen `audit_data`; la tabla `audit_events` no permite UPDATE/DELETE y el rol
+del consumidor solo tiene SELECT/INSERT. El hash chain y la deduplicación por
+`eventId` persisten entre reinicios.
 
 ### Servicios de negocio
 
@@ -174,6 +182,7 @@ Con los servicios levantados y el entorno virtual activo, ejecuta los scripts de
 ```powershell
 python .\validar\validar_contratos.py
 python .\scripts_test\test_auth_boundary.py
+python .\scripts_test\test_audit_persistence.py
 python .\scripts_test\test_contract_consumers.py
 python .\scripts_test\test_business_producers.py
 python .\scripts_test\test_multimedia_flow.py
@@ -189,10 +198,10 @@ Cada script valida un comportamiento distinto:
 
 - `validar_contratos.py`: valida los ejemplos contra los esquemas versionados.
 - `test_auth_boundary.py`: verifica JWT RS256, issuer/cliente/expiración, secreto Gateway y rol vigente en DB.
+- `test_audit_persistence.py`: verifica persistencia append-only, hash chain, reentrega idempotente y requeue ante fallo DB.
 - `test_contract_consumers.py`: verifica validación, DLQ y versiones desconocidas en los consumidores.
 - `test_business_producers.py`: valida contratos de productores, RBAC básico, validación de entradas y relay outbox.
 - `test_multimedia_flow.py`: verifica firma de carga, HEAD/metadata, promoción a clave final y URL de descarga.
-- `test_multimedia_flow.py`: verifica firma POST, restricciones de objeto, confirmación y URL privada de descarga.
 - `publicar_evento_saga.py`: flujo feliz de la saga y propagación de eventos.
 - `test_idempotency_saga.py`: detección de un mensaje duplicado mediante Redis.
 - `test_multimedia_nosql.py`: publica un evento multimedia y verifica su metadata en MongoDB.

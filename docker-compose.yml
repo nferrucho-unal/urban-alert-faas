@@ -49,6 +49,34 @@ services:
       timeout: 5s
       retries: 5
 
+  audit_db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=audit_admin
+      - POSTGRES_PASSWORD=audit_admin_secure_pass
+      - POSTGRES_DB=urban_alert_audit
+    volumes:
+      - audit_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U audit_admin -d urban_alert_audit"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  audit_migrate:
+    image: postgres:16-alpine
+    restart: "no"
+    entrypoint: ["sh", "-c"]
+    command: ["psql -h audit_db -U audit_admin -d urban_alert_audit -v ON_ERROR_STOP=1 -f /migrations/001_audit_store.sql"]
+    environment:
+      - PGPASSWORD=audit_admin_secure_pass
+    volumes:
+      - ./audit_init/001_audit_store.sql:/migrations/001_audit_store.sql:ro
+    depends_on:
+      audit_db:
+        condition: service_healthy
+
   seaweed-s3:
     image: chrislusf/seaweedfs:4.48
     command: ["server", "-dir=/data", "-s3", "-s3.config=/etc/seaweedfs/s3.json", "-s3.iam=false"]
@@ -275,13 +303,13 @@ services:
     command: ["python", "app.py"]
     environment:
       - BROKER_URL=amqp://urban_user:urban_secure_pass@rabbitmq:5672/%2F
-      - REDIS_URL=redis://redis:6379/0
+      - AUDIT_DATABASE_URL=postgresql://audit_writer:audit_writer_secure_pass@audit_db:5432/urban_alert_audit
       - PYTHONPATH=/app
     depends_on:
       rabbitmq:
         condition: service_healthy
-      redis:
-        condition: service_healthy
+      audit_migrate:
+        condition: service_completed_successfully
 
   fn_audit:
     build: .
@@ -292,13 +320,13 @@ services:
     command: ["python", "app.py"]
     environment:
       - BROKER_URL=amqp://urban_user:urban_secure_pass@rabbitmq:5672/%2F
-      - REDIS_URL=redis://redis:6379/0
+      - AUDIT_DATABASE_URL=postgresql://audit_writer:audit_writer_secure_pass@audit_db:5432/urban_alert_audit
       - PYTHONPATH=/app
     depends_on:
       rabbitmq:
         condition: service_healthy
-      redis:
-        condition: service_healthy
+      audit_migrate:
+        condition: service_completed_successfully
 
   fn_multimedia:
     build: .
@@ -320,6 +348,7 @@ services:
 
 volumes:
   rabbitmq_data:
+  audit_data:
   seaweed_s3_data:
   gis_data:
   core_primary_data:

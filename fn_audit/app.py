@@ -1,8 +1,13 @@
 import hashlib
 import json
+import logging
 import os
 import sys
+
 import pika
+import psycopg2
+from psycopg2.extras import Json
+
 from validar.event_contracts import (
     ContractValidationError,
     UnsupportedEventError,
@@ -13,8 +18,9 @@ from validar.event_contracts import (
 BROKER_URL = os.environ.get(
     "BROKER_URL", "amqp://urban_user:urban_secure_pass@localhost:5672/%2F"
 )
-EVENT_STORE = []  # Bitácora Append-only simulada en memoria
-EVENT_IDS = set()
+AUDIT_DATABASE_URL = os.environ.get("AUDIT_DATABASE_URL")
+GENESIS_HASH = "0" * 64
+LOGGER = logging.getLogger("urban-alert-audit")
 AUDIT_EVENT_TYPES = {
     "reporte.creado",
     "reporte.validado",
@@ -23,9 +29,78 @@ AUDIT_EVENT_TYPES = {
 }
 
 
-def calcular_hash_evento(evento_dict):
-    evento_string = json.dumps(evento_dict, sort_keys=True)
-    return hashlib.sha256(evento_string.encode("utf-8")).hexdigest()
+def database_connection():
+    if not AUDIT_DATABASE_URL:
+        raise RuntimeError("Falta configurar AUDIT_DATABASE_URL.")
+    return psycopg2.connect(AUDIT_DATABASE_URL)
+
+
+def calcular_hash_evento(evento_dict, hash_previo):
+    evento_string = json.dumps(
+        evento_dict, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    contenido = f"{hash_previo}:{evento_string}".encode("utf-8")
+    return hashlib.sha256(contenido).hexdigest()
+
+
+def persistir_evento_auditoria(evento):
+    connection = database_connection()
+    try:
+        with connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT last_hash FROM audit_chain_state WHERE singleton = TRUE FOR UPDATE"
+                )
+                chain_state = cursor.fetchone()
+                if chain_state is None:
+                    raise RuntimeError("No existe el estado inicial de la cadena de auditoría.")
+                hash_previo = chain_state[0]
+
+                cursor.execute(
+                    "SELECT event_id FROM audit_events WHERE event_id = %s",
+                    (evento["eventId"],),
+                )
+                if cursor.fetchone() is not None:
+                    return None
+
+                record_hash = calcular_hash_evento(evento, hash_previo)
+                cursor.execute(
+                    """
+                    INSERT INTO audit_events
+                        (event_id, event_type, event_version, occurred_at,
+                         correlation_id, report_id, actor_id, payload,
+                         previous_hash, record_hash)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        evento["eventId"],
+                        evento["eventType"],
+                        evento["version"],
+                        evento["occurredAt"],
+                        evento["correlationId"],
+                        evento["reportId"],
+                        evento["data"]["actorId"],
+                        Json(evento),
+                        hash_previo,
+                        record_hash,
+                    ),
+                )
+                cursor.execute(
+                    "UPDATE audit_chain_state SET last_hash = %s, last_event_id = %s WHERE singleton = TRUE",
+                    (record_hash, evento["eventId"]),
+                )
+                return {
+                    "eventId": evento["eventId"],
+                    "reportId": evento["reportId"],
+                    "evento": evento["eventType"],
+                    "actorId": evento["data"]["actorId"],
+                    "correlationId": evento["correlationId"],
+                    "occurredAt": evento["occurredAt"],
+                    "hash_anterior": hash_previo,
+                    "hash": record_hash,
+                }
+    finally:
+        connection.close()
 
 
 def callback_auditoria(ch, method, properties, body):
@@ -53,39 +128,18 @@ def callback_auditoria(ch, method, properties, body):
         return
 
     try:
-        if evento_origen["eventId"] in EVENT_IDS:
+        nuevo_bloque = persistir_evento_auditoria(evento_origen)
+        if nuevo_bloque is None:
             ch.basic_ack(delivery_tag=method.delivery_tag)
             return
 
-        # Estructurar bloque de auditoría inmutable (Hash Chaining)
-        hash_previo = (
-            calcular_hash_evento(EVENT_STORE[-1])
-            if EVENT_STORE
-            else "00000000"
-        )
-        nuevo_bloque = {
-            "eventId": evento_origen["eventId"],
-            "reportId": evento_origen["reportId"],
-            "evento": evento_origen["eventType"],
-            "actorId": evento_origen["data"]["actorId"],
-            "correlationId": evento_origen["correlationId"],
-            "occurredAt": evento_origen["occurredAt"],
-            "hash_anterior": hash_previo,
-        }
-
-        EVENT_STORE.append(nuevo_bloque)
-        EVENT_IDS.add(evento_origen["eventId"])
-
         # Structured Logging obligatorio (Factor XI - stdout)
-        print(
-            json.dumps({"log_level": "INFO", "audit_record": nuevo_bloque}),
-            flush=True,
-        )
+        LOGGER.info(json.dumps({"log_level": "INFO", "audit_record": nuevo_bloque}))
 
         # Confirmar procesamiento exitoso a RabbitMQ (Ack)
         ch.basic_ack(delivery_tag=method.delivery_tag)
     except Exception as e:
-        print(f"Error procesando auditoría: {e}", file=sys.stderr, flush=True)
+        LOGGER.exception("Error persistiendo auditoría: %s", e)
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
 
