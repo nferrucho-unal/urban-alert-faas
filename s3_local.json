@@ -1,0 +1,19 @@
+{
+  "identities": [
+    {
+      "name": "urban-alert-core",
+      "credentials": [
+        {
+          "accessKey": "urban_minio",
+          "secretKey": "urban_minio_secure_pass"
+        }
+      ],
+      "actions": [
+        "Read:urban-alert-evidencias",
+        "Write:urban-alert-evidencias",
+        "List:urban-alert-evidencias",
+        "Admin:urban-alert-evidencias"
+      ]
+    }
+  ]
+}

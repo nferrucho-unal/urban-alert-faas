@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://urban-alert.local/schemas/multimedia.upload.v1.schema.json",
+  "title": "multimedia.upload v1",
+  "description": "Nombre de eventType ya en uso en el repositorio (fn_multimedia). Aquí solo se formaliza su forma dentro del sobre común. Consumido por: fn_multimedia (persiste referencia + metadatos en MongoDB).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["eventId", "eventType", "version", "occurredAt", "correlationId", "reportId", "data"],
+  "properties": {
+    "eventId":       { "type": "string", "format": "uuid" },
+    "eventType":     { "const": "multimedia.upload" },
+    "version":       { "const": 1 },
+    "occurredAt":    { "type": "string", "format": "date-time" },
+    "correlationId": { "type": "string", "format": "uuid" },
+    "reportId":      { "type": "string", "format": "uuid" },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bucket", "objectKey", "mimeType"],
+      "properties": {
+        "bucket":     { "type": "string" },
+        "objectKey":  { "type": "string" },
+        "mimeType":   { "type": "string" },
+        "tamanoBytes": { "type": "integer", "minimum": 0 },
+        "metadata":   { "type": "object" },
+        "location": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["longitude", "latitude"],
+          "properties": {
+            "longitude": { "type": "number", "minimum": -180, "maximum": 180 },
+            "latitude":  { "type": "number", "minimum": -90, "maximum": 90 }
+          }
+        }
+      }
+    }
+  }
+}

@@ -7,6 +7,11 @@ import time
 
 import pika
 import redis
+from validar.event_contracts import (
+    ContractValidationError,
+    UnsupportedEventError,
+    validate_event,
+)
 
 BROKER_URL = os.environ.get(
     "BROKER_URL", "amqp://urban_user:urban_secure_pass@localhost:5672/%2F"
@@ -18,6 +23,7 @@ MAX_PROVIDER_ATTEMPTS = 3
 CIRCUIT_FAILURE_THRESHOLD = 3
 CIRCUIT_COOLDOWN_SECONDS = 4
 BASE_RETRY_DELAY_SECONDS = 0.2
+NOTIFICATION_EVENT_TYPES = {"reporte.creado", "obra.asignada"}
 
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 provider_failure_count = 0
@@ -60,21 +66,30 @@ def enviar_notificacion():
 
 
 def callback_notificaciones_con_dlq(ch, method, properties, body):
-    """Consume ReporteCreado, aplica idempotencia Redis y preserva la DLQ."""
+    """Valida reporte.creado, aplica idempotencia Redis y preserva la DLQ."""
     try:
-        evento = json.loads(body.decode("utf-8"))
-        if not isinstance(evento, dict):
-            raise ValueError("El evento debe ser un objeto JSON")
-        report_id = evento.get("reportId")
-        if not isinstance(report_id, str) or not report_id.strip():
-            raise ValueError("El evento requiere un reportId válido")
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        evento = validate_event(json.loads(body.decode("utf-8")))
+    except UnsupportedEventError as error:
+        print(f"Evento de notificación ignorado: {error}", file=sys.stderr, flush=True)
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+        return
+    except (UnicodeDecodeError, json.JSONDecodeError, ContractValidationError) as error:
         print(f"Evento de notificación inválido: {error}", file=sys.stderr, flush=True)
         ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
         return
 
+    if evento["eventType"] not in NOTIFICATION_EVENT_TYPES:
+        print(
+            f"Evento no consumido por notificaciones: {evento['eventType']}",
+            file=sys.stderr,
+            flush=True,
+        )
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+        return
+
+    report_id = evento["reportId"]
     payload_hash = hashlib.sha256(body).hexdigest()
-    event_id = getattr(properties, "correlation_id", None) or payload_hash
+    event_id = evento["eventId"]
     redis_key = clave_idempotencia(event_id)
 
     try:
@@ -166,7 +181,7 @@ def iniciar_consumidor():
     channel = connection.channel()
 
     channel.basic_qos(prefetch_count=1)
-    channel.exchange_declare(exchange="urban_alert_dlx", exchange_type="topic")
+    channel.exchange_declare(exchange="urban_alert_dlx", exchange_type="topic", durable=True)
     channel.queue_declare(queue="q_dead_letter_notifications", durable=True)
     channel.queue_bind(
         exchange="urban_alert_dlx",
@@ -174,7 +189,7 @@ def iniciar_consumidor():
         routing_key="notificaciones.failed",
     )
 
-    channel.exchange_declare(exchange="urban_alert_events", exchange_type="topic")
+    channel.exchange_declare(exchange="urban_alert_events", exchange_type="topic", durable=True)
     channel.queue_declare(
         queue="q_notificaciones_core",
         durable=True,
@@ -183,11 +198,12 @@ def iniciar_consumidor():
             "x-dead-letter-routing-key": "notificaciones.failed",
         },
     )
-    channel.queue_bind(
-        exchange="urban_alert_events",
-        queue="q_notificaciones_core",
-        routing_key="reporte.creado",
-    )
+    for event_type in NOTIFICATION_EVENT_TYPES:
+        channel.queue_bind(
+            exchange="urban_alert_events",
+            queue="q_notificaciones_core",
+            routing_key=event_type,
+        )
 
     print(" [*] FaaS Notificaciones escuchando ReporteCreado con DLQ activa.", flush=True)
     channel.basic_consume(

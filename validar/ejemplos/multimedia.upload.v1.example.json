@@ -1,0 +1,22 @@
+{
+  "eventId": "d6c4f507-8192-4dae-1f2a-3b4c5d6e7f80",
+  "eventType": "multimedia.upload",
+  "version": 1,
+  "occurredAt": "2026-09-26T14:05:30Z",
+  "correlationId": "1b2c3d4e-5f60-4718-9293-a4b5c6d7e8f9",
+  "reportId": "9f8e7d6c-5b4a-4321-9876-1a2b3c4d5e6f",
+  "data": {
+    "bucket": "urban-alert-multimedia-prod",
+    "objectKey": "reportes/9f8e7d6c-5b4a-4321-9876-1a2b3c4d5e6f/foto-01.jpg",
+    "mimeType": "image/jpeg",
+    "tamanoBytes": 2456789,
+    "metadata": {
+      "formato": "JPEG",
+      "resolucion": "1920x1080"
+    },
+    "location": {
+      "longitude": -74.05,
+      "latitude": 4.65
+    }
+  }
+}

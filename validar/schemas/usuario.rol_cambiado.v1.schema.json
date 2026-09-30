@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://urban-alert.local/schemas/usuario.rol_cambiado.v1.schema.json",
+  "title": "usuario.rol_cambiado v1",
+  "description": "Publicado por ServicioUsuarios cuando un admin cambia el rol de un usuario. No se refiere a un reporte, por eso 'reportId' es null. Consumido por: ServicioAuditoria; opcionalmente ServicioObras para revalidar permisos en caliente.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["eventId", "eventType", "version", "occurredAt", "correlationId", "reportId", "data"],
+  "properties": {
+    "eventId":       { "type": "string", "format": "uuid" },
+    "eventType":     { "const": "usuario.rol_cambiado" },
+    "version":       { "const": 1 },
+    "occurredAt":    { "type": "string", "format": "date-time" },
+    "correlationId": { "type": "string", "format": "uuid" },
+    "reportId":      { "const": null },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["usuarioId", "actorId", "rolPrevio", "rolNuevo"],
+      "properties": {
+        "usuarioId": { "type": "string", "format": "uuid", "description": "sub de Cognito del usuario afectado" },
+        "actorId":   { "type": "string", "format": "uuid", "description": "admin que hizo el cambio; nunca igual a usuarioId" },
+        "rolPrevio": { "enum": ["ciudadano", "gestor", "admin"] },
+        "rolNuevo":  { "enum": ["ciudadano", "gestor", "admin"] }
+      }
+    }
+  }
+}

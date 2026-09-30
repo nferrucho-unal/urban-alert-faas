@@ -6,6 +6,7 @@ import uuid
 
 import pika
 import redis
+from eventos import evento_reporte_creado
 
 BROKER_URL = os.environ.get(
     "BROKER_URL", "amqp://urban_user:urban_secure_pass@localhost:5672/%2F"
@@ -18,7 +19,7 @@ def publicar_evento(event_id, body):
     connection = pika.BlockingConnection(pika.URLParameters(BROKER_URL))
     try:
         channel = connection.channel()
-        channel.exchange_declare(exchange="urban_alert_events", exchange_type="topic")
+        channel.exchange_declare(exchange="urban_alert_events", exchange_type="topic", durable=True)
         channel.confirm_delivery()
         channel.basic_publish(
             exchange="urban_alert_events",
@@ -51,17 +52,13 @@ def probar_idempotencia_y_estado_redis():
     client.ping()
 
     event_id = str(uuid.uuid4())
-    report_id = f"REP-REDIS-{event_id[:12]}"
-    event = {
-        "reportId": report_id,
-        "actor": "test_notifications_redis",
-        "descripcion": "Prueba de notificación con estado Redis",
-    }
+    event = evento_reporte_creado(event_id=event_id)
+    report_id = event["reportId"]
     body = json.dumps(event, separators=(",", ":")).encode("utf-8")
     payload_hash = hashlib.sha256(body).hexdigest()
     key = f"notification:{event_id}"
 
-    publicar_evento(event_id, body)
+    publicar_evento(event["correlationId"], body)
     record = esperar_estado(client, key)
     assert record["report_id"] == report_id, record
     assert record["payload_hash"] == payload_hash, record
@@ -69,7 +66,7 @@ def probar_idempotencia_y_estado_redis():
     assert record["attempts"] in {1, 2, 3}, record
     assert client.ttl(key) > 0
 
-    publicar_evento(event_id, body)
+    publicar_evento(event["correlationId"], body)
     time.sleep(0.5)
     duplicate_record = json.loads(client.get(key))
     assert duplicate_record == record, duplicate_record

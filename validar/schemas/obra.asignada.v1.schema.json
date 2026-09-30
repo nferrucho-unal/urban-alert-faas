@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://urban-alert.local/schemas/obra.asignada.v1.schema.json",
+  "title": "obra.asignada v1",
+  "description": "Publicado por ServicioObras al crear/asignar una obra a partir de reporte.validado (outbox transaccional sobre la misma escritura). Consumido por: ServicioNotificaciones, ServicioAuditoria.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["eventId", "eventType", "version", "occurredAt", "correlationId", "reportId", "data"],
+  "properties": {
+    "eventId":       { "type": "string", "format": "uuid" },
+    "eventType":     { "const": "obra.asignada" },
+    "version":       { "const": 1 },
+    "occurredAt":    { "type": "string", "format": "date-time" },
+    "correlationId": { "type": "string", "format": "uuid", "description": "El mismo correlationId de reporte.creado / reporte.validado que originó esta obra." },
+    "reportId":      { "type": "string", "format": "uuid" },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["obraId", "actorId", "entidadResponsable"],
+      "properties": {
+        "obraId":             { "type": "string", "format": "uuid" },
+        "actorId":            { "type": "string", "format": "uuid" },
+        "entidadResponsable": { "type": "string" },
+        "presupuestoAsignado": { "type": "number", "minimum": 0 }
+      }
+    }
+  }
+}

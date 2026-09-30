@@ -6,6 +6,12 @@ from datetime import datetime, timezone
 import pika
 from pymongo import ASCENDING, MongoClient
 from pymongo.errors import PyMongoError
+from validar.event_contracts import (
+    ContractValidationError,
+    UnsupportedEventError,
+    dead_letter_invalid_message,
+    validate_event,
+)
 
 BROKER_URL = os.environ.get(
     "BROKER_URL", "amqp://urban_user:urban_secure_pass@localhost:5672/%2F"
@@ -36,23 +42,30 @@ def persistir_metadatos(documento):
 
 
 def callback_multimedia(ch, method, properties, body):
-    """Consume eventos de subida y guarda referencias/metadata fuera de PostGIS."""
+    """Valida multimedia.upload y guarda referencias/metadata fuera de PostGIS."""
     try:
-        evento = json.loads(body.decode("utf-8"))
-        if not isinstance(evento, dict):
-            raise ValueError("El evento debe ser un objeto JSON")
+        evento = validate_event(
+            json.loads(body.decode("utf-8")), "multimedia.upload"
+        )
+    except UnsupportedEventError as error:
+        print(f"Evento multimedia ignorado: {error}", file=sys.stderr, flush=True)
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+        return
+    except (UnicodeDecodeError, json.JSONDecodeError, ContractValidationError) as error:
+        print(f"Evento multimedia inválido: {error}", file=sys.stderr, flush=True)
+        dead_letter_invalid_message(
+            ch, method, properties, body, "multimedia.invalid", str(error)
+        )
+        return
 
-        report_id = evento.get("reportId")
-        object_key = evento.get("objectKey")
-        bucket = evento.get("bucket")
-        if not all(
-            isinstance(value, str) and value.strip()
-            for value in (report_id, object_key, bucket)
-        ):
-            raise ValueError("El evento requiere reportId, objectKey y bucket")
+    data = evento["data"]
+    report_id = evento["reportId"]
+    object_key = data["objectKey"]
+    bucket = data["bucket"]
 
+    try:
         object_path = object_key.lstrip("/")
-        metadata = evento.get("metadata")
+        metadata = data.get("metadata")
         if not isinstance(metadata, dict):
             metadata = {}
 
@@ -60,11 +73,12 @@ def callback_multimedia(ch, method, properties, body):
             "report_id": report_id,
             "object_key": object_key,
             "bucket": bucket,
-            "original_url": f"https://{bucket}.s3.amazonaws.com/{object_path}",
             "metadata": metadata,
+            "mime_type": data["mimeType"],
+            "size_bytes": data.get("tamanoBytes"),
             "updated_at": datetime.now(timezone.utc),
         }
-        location = evento.get("location")
+        location = data.get("location")
         if isinstance(location, dict):
             longitude = location.get("longitude")
             latitude = location.get("latitude")
@@ -89,9 +103,6 @@ def callback_multimedia(ch, method, properties, body):
             flush=True,
         )
         ch.basic_ack(delivery_tag=method.delivery_tag)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-        print(f"Evento multimedia inválido: {error}", file=sys.stderr, flush=True)
-        ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
     except PyMongoError as error:
         print(f"Error persistiendo metadata en MongoDB: {error}", file=sys.stderr, flush=True)
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
@@ -105,7 +116,14 @@ def iniciar_consumidor():
     connection = pika.BlockingConnection(pika.URLParameters(BROKER_URL))
     channel = connection.channel()
     channel.basic_qos(prefetch_count=1)
-    channel.exchange_declare(exchange="urban_alert_events", exchange_type="topic")
+    channel.exchange_declare(exchange="urban_alert_events", exchange_type="topic", durable=True)
+    channel.exchange_declare(exchange="urban_alert_dlx", exchange_type="topic", durable=True)
+    channel.queue_declare(queue="q_dead_letter_multimedia", durable=True)
+    channel.queue_bind(
+        exchange="urban_alert_dlx",
+        queue="q_dead_letter_multimedia",
+        routing_key="multimedia.invalid",
+    )
     channel.queue_declare(queue="q_multimedia_processing", durable=True)
     channel.queue_bind(
         exchange="urban_alert_events",
@@ -120,6 +138,7 @@ def iniciar_consumidor():
     channel.basic_consume(
         queue="q_multimedia_processing", on_message_callback=callback_multimedia
     )
+    channel.confirm_delivery()
     channel.start_consuming()
 
 

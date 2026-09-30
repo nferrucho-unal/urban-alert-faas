@@ -2,6 +2,7 @@ import pika
 import json
 import time
 import uuid
+from eventos import evento_reporte_creado
 
 BROKER_LOCAL = "amqp://urban_user:urban_secure_pass@localhost:5672/%2F"
 
@@ -10,17 +11,13 @@ def probar_ataque_duplicados():
     connection = pika.BlockingConnection(params)
     channel = connection.channel()
     
-    channel.exchange_declare(exchange='urban_alert_events', exchange_type='topic')
+    channel.exchange_declare(exchange='urban_alert_events', exchange_type='topic', durable=True)
     
-    report_id = "REP-2026-BOGOTA-1001"
-    # ID único de correlación compartido para simular el duplicado exacto del bus de eventos
-    correlation_id_compartido = f"idempotency-{uuid.uuid4()}"
-    
-    payload = {
-        "reportId": report_id,
-        "actor": "Diana_Reyes_Marciales",
-        "descripcion": "Daño severo en alumbrado público"
-    }
+    report_id = str(uuid.uuid4())
+    correlation_id_compartido = str(uuid.uuid4())
+    payload = evento_reporte_creado(
+        report_id=report_id, correlation_id=correlation_id_compartido
+    )
     
     propiedades = pika.BasicProperties(
         correlation_id=correlation_id_compartido,

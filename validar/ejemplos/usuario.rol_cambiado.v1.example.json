@@ -1,0 +1,14 @@
+{
+  "eventId": "e7d5f618-9203-4ebf-2a3b-4c5d6e7f8091",
+  "eventType": "usuario.rol_cambiado",
+  "version": 1,
+  "occurredAt": "2026-09-26T09:00:00Z",
+  "correlationId": "f0e1d2c3-b4a5-4968-8778-899aabbccdde",
+  "reportId": null,
+  "data": {
+    "usuarioId": "55555555-5555-4555-8555-555555555555",
+    "actorId": "66666666-6666-4666-8666-666666666666",
+    "rolPrevio": "ciudadano",
+    "rolNuevo": "gestor"
+  }
+}

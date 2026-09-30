@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://urban-alert.local/schemas/envelope.schema.json",
+  "title": "Sobre común de evento — Urban Alert",
+  "description": "Forma que debe tener TODO evento publicado por cualquiera de los 5 servicios, sin excepción. Los esquemas de cada eventType (ver schemas/<eventType>.v<version>.schema.json) heredan esta forma y solo agregan restricciones sobre 'data'.",
+  "type": "object",
+  "required": ["eventId", "eventType", "version", "occurredAt", "correlationId", "data"],
+  "additionalProperties": false,
+  "properties": {
+    "eventId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Identifica este mensaje puntual. Es la clave de idempotencia: un consumidor que ya vio este eventId descarta el mensaje sin reprocesarlo."
+    },
+    "eventType": {
+      "type": "string",
+      "pattern": "^[a-z]+\\.[a-z_]+$",
+      "description": "Formato '<agregado>.<hecho_de_negocio>', p. ej. 'reporte.creado'. Nunca un verbo genérico como 'update' o 'change'."
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Versión del esquema de 'data' para este eventType. Un cambio incompatible sube este número y coexiste con la versión anterior mientras se migran los consumidores."
+    },
+    "occurredAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Instante en que ocurrió el hecho de negocio (no el instante en que se publicó el mensaje)."
+    },
+    "correlationId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Se origina en la solicitud que disparó el evento y viaja sin cambios por toda la cadena de servicios."
+    },
+    "reportId": {
+      "type": ["string", "null"],
+      "format": "uuid",
+      "description": "Presente cuando el evento se refiere a un reporte. Eventos de otros agregados (p. ej. usuario.rol_cambiado) lo omiten o lo dejan en null."
+    },
+    "data": {
+      "type": "object",
+      "description": "Contenido específico del eventType. Ver el esquema concreto de cada evento para sus campos y restricciones."
+    }
+  }
+}

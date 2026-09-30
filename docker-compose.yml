@@ -3,9 +3,13 @@ services:
   rabbitmq:
     image: rabbitmq:3.13-management-alpine
     container_name: urban_alert_mq
+    # El entrypoint arregla ownership y baja a rabbitmq mediante su-exec.
+    user: "0:0"
     ports:
       - "5672:5672"
       - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
     environment:
       - RABBITMQ_DEFAULT_USER=urban_user
       - RABBITMQ_DEFAULT_PASS=urban_secure_pass
@@ -44,6 +48,32 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  seaweed-s3:
+    image: chrislusf/seaweedfs:4.48
+    command: ["server", "-dir=/data", "-s3", "-s3.config=/etc/seaweedfs/s3.json", "-s3.iam=false"]
+    ports:
+      - "8333:8333"
+    volumes:
+      - seaweed_s3_data:/data
+      - ./s3_local.json:/etc/seaweedfs/s3.json:ro
+
+  s3_init:
+    build: .
+    restart: "no"
+    command: ["python", "-m", "core_services.create_dev_bucket"]
+    volumes:
+      - ./core_services:/app/core_services
+    environment:
+      - S3_BUCKET=urban-alert-evidencias
+      - S3_ENDPOINT_URL=http://seaweed-s3:8333
+      - AWS_REGION=us-east-1
+      - S3_ACCESS_KEY_ID=urban_minio
+      - S3_SECRET_ACCESS_KEY=urban_minio_secure_pass
+      - PYTHONPATH=/app
+    depends_on:
+      seaweed-s3:
+        condition: service_started
 
   # 3. BASE DE DATOS CORE - PRIMARIA
   core_db_primary:
@@ -124,15 +154,129 @@ services:
   # SERVICIOS DE CÓMPUTO FAAS (Consumidores Asíncronos con auto-recuperación)
   # =========================================================================
 
+  core_api:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "core_services.app"]
+    ports:
+      - "127.0.0.1:5001:5000"
+    volumes:
+      - ./core_services:/app/core_services
+      - ./validar:/app/validar:ro
+    environment:
+      - DATABASE_PRIMARY_URL=postgresql://app_core_user:app_secure_pass@core_db_primary:5432/urban_alert_core
+      - GEOSPATIAL_API_URL=http://service_geospatial:5000
+      - S3_BUCKET=urban-alert-evidencias
+      - S3_ENDPOINT_URL=http://seaweed-s3:8333
+      - S3_PRESIGN_ENDPOINT_URL=http://localhost:8333
+      - AWS_REGION=us-east-1
+      - S3_ACCESS_KEY_ID=urban_minio
+      - S3_SECRET_ACCESS_KEY=urban_minio_secure_pass
+      - UPLOAD_URL_TTL_SECONDS=300
+      - DOWNLOAD_URL_TTL_SECONDS=300
+      - MAX_UPLOAD_BYTES=15728640
+      - ALLOW_TEST_USER_CONTEXT=true
+      - GATEWAY_SHARED_SECRET=urban-alert-local-gateway-secret-change-before-deploy
+      - PORT=5000
+      - PYTHONPATH=/app
+    depends_on:
+      core_migrate:
+        condition: service_completed_successfully
+      s3_init:
+        condition: service_completed_successfully
+
+  core_migrate:
+    image: postgres:16-alpine
+    restart: "no"
+    entrypoint: ["sh", "-c"]
+    command: ["psql -h core_db_primary -U core_admin -d urban_alert_core -v ON_ERROR_STOP=1 -f /migrations/002_business_services.sql"]
+    environment:
+      - PGPASSWORD=core_secure_pass
+    volumes:
+      - ./core_init/002_business_services.sql:/migrations/002_business_services.sql:ro
+    depends_on:
+      core_db_primary:
+        condition: service_healthy
+
+  outbox_relay:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "core_services.outbox_relay"]
+    volumes:
+      - ./core_services:/app/core_services
+      - ./validar:/app/validar:ro
+    environment:
+      - DATABASE_PRIMARY_URL=postgresql://app_core_user:app_secure_pass@core_db_primary:5432/urban_alert_core
+      - BROKER_URL=amqp://urban_user:urban_secure_pass@rabbitmq:5672/%2F
+      - PYTHONPATH=/app
+    depends_on:
+      core_db_primary:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  service_geospatial:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "core_services.geospatial"]
+    ports:
+      - "5002:5000"
+    volumes:
+      - ./core_services:/app/core_services
+      - ./validar:/app/validar:ro
+    environment:
+      - DATABASE_GEO_URL=postgresql://analista_obras:read_only_gis_pass@postgis_db:5432/urban_alert_geo
+      - PORT=5000
+      - ALLOW_TEST_USER_CONTEXT=true
+      - PYTHONPATH=/app
+    depends_on:
+      postgis_migrate:
+        condition: service_completed_successfully
+
+  postgis_migrate:
+    image: postgis/postgis:16-3.4-alpine
+    restart: "no"
+    entrypoint: ["sh", "-c"]
+    command: ["psql -h postgis_db -U gis_admin -d urban_alert_geo -v ON_ERROR_STOP=1 -f /migrations/002_reportes_geo.sql"]
+    environment:
+      - PGPASSWORD=gis_secure_pass
+    volumes:
+      - ./postgis_init/002_reportes_geo.sql:/migrations/002_reportes_geo.sql:ro
+    depends_on:
+      postgis_db:
+        condition: service_healthy
+
+  geospatial_projector:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "core_services.geospatial_projector"]
+    volumes:
+      - ./core_services:/app/core_services
+      - ./validar:/app/validar:ro
+    environment:
+      - DATABASE_GEO_URL=postgresql://svc_geo_projector:geo_projector_secure_pass@postgis_db:5432/urban_alert_geo
+      - BROKER_URL=amqp://urban_user:urban_secure_pass@rabbitmq:5672/%2F
+      - REDIS_URL=redis://redis:6379/0
+      - PYTHONPATH=/app
+    depends_on:
+      postgis_migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   fn_notifications:
     build: .
     restart: always  # TÁCTICA DE RECUPERACIÓN: Si el contenedor muere o cae, Docker lo levanta solo
     volumes:
       - ./fn_notifications:/app
+      - ./validar:/app/validar:ro
     command: ["python", "app.py"]
     environment:
       - BROKER_URL=amqp://urban_user:urban_secure_pass@rabbitmq:5672/%2F
       - REDIS_URL=redis://redis:6379/0
+      - PYTHONPATH=/app
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -144,10 +288,12 @@ services:
     restart: always
     volumes:
       - ./fn_audit:/app
+      - ./validar:/app/validar:ro
     command: ["python", "app.py"]
     environment:
       - BROKER_URL=amqp://urban_user:urban_secure_pass@rabbitmq:5672/%2F
       - REDIS_URL=redis://redis:6379/0
+      - PYTHONPATH=/app
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -159,11 +305,13 @@ services:
     restart: always
     volumes:
       - ./fn_multimedia:/app
+      - ./validar:/app/validar:ro
     command: ["python", "app.py"]
     environment:
       - BROKER_URL=amqp://urban_user:urban_secure_pass@rabbitmq:5672/%2F
       - MONGO_URL=mongodb://mongodb:27017
       - MONGO_DATABASE=urban_alert_media
+      - PYTHONPATH=/app
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -171,6 +319,8 @@ services:
         condition: service_healthy
 
 volumes:
+  rabbitmq_data:
+  seaweed_s3_data:
   gis_data:
   core_primary_data:
   core_replica_data:

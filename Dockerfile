@@ -1,5 +1,5 @@
-# Usar una imagen oficial de Python liviana (Alpine)
-FROM python:3.12-alpine
+# Debian slim provides binary wheels for database and crypto dependencies.
+FROM python:3.12-slim
 
 WORKDIR /app
 
@@ -12,6 +12,7 @@ COPY . .
 
 # Variable de entorno para indicarle a Flask qué puerto usar internamente
 ENV PORT=5000
+ENV PYTHONPATH=/app
 
 # Ejecutar Flask escuchando en todas las interfaces de red (0.0.0.0)
 CMD ["sh", "-c", "flask run --host=0.0.0.0 --port=$PORT"]

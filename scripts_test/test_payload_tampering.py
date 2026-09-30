@@ -2,6 +2,8 @@ import pika
 import json
 import time
 import uuid
+import copy
+from eventos import evento_reporte_creado
 
 BROKER_LOCAL = "amqp://urban_user:urban_secure_pass@localhost:5672/%2F"
 
@@ -10,17 +12,18 @@ def ejecutar_ataque_tampering():
     connection = pika.BlockingConnection(params)
     channel = connection.channel()
     
-    channel.exchange_declare(exchange='urban_alert_events', exchange_type='topic')
+    channel.exchange_declare(exchange='urban_alert_events', exchange_type='topic', durable=True)
     
-    report_id = "REP-2026-ALERTA-88"
-    correlation_id_fijo = f"tampering-{uuid.uuid4()}"
+    report_id = str(uuid.uuid4())
+    event_id = str(uuid.uuid4())
+    correlation_id_fijo = str(uuid.uuid4())
     
     # 1. ENVÍO ORIGINAL: Datos auténticos del ciudadano
-    payload_autentico = {
-        "reportId": report_id,
-        "actor": "Mario_Bross",
-        "descripcion": "Daño severo en alcantarillado central"
-    }
+    payload_autentico = evento_reporte_creado(
+        report_id=report_id,
+        event_id=event_id,
+        correlation_id=correlation_id_fijo,
+    )
     
     propiedades = pika.BasicProperties(correlation_id=correlation_id_fijo, content_type="application/json")
     
@@ -30,12 +33,9 @@ def ejecutar_ataque_tampering():
     
     time.sleep(1.5)
     
-    # 2. ENVÍO ALTERADO (Ataque/Inyección): Mismo ID de mensaje, pero alterando la descripción o datos del reporte
-    payload_adulterado = {
-        "reportId": report_id,
-        "actor": "Mario_Bross",
-        "descripcion": "INYECCIÓN DE PAYLOAD ALTERADO - CAMBIO DE ATRIBUTOS" # Modificación del cuerpo
-    }
+    # 2. Reutilizar el eventId con un cuerpo distinto debe disparar la DLQ.
+    payload_adulterado = copy.deepcopy(payload_autentico)
+    payload_adulterado["data"]["lat"] = 4.7
     
     print(" [⚠️ Hacker] Intentando enviar payload alterado reutilizando el ID de correlación...")
     channel.basic_publish(exchange='urban_alert_events', routing_key='reporte.creado', 

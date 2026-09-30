@@ -1,0 +1,14 @@
+.git
+.venv
+env
+.terraform
+__pycache__
+**/__pycache__
+*.py[cod]
+.pytest_cache
+**/.pytest_cache
+.env
+.env.*
+*.tfvars
+*.tfvars.json
+s3_local.json

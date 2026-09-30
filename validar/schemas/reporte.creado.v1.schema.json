@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://urban-alert.local/schemas/reporte.creado.v1.schema.json",
+  "title": "reporte.creado v1",
+  "description": "Publicado por ServicioReportes tras confirmar la transacción de creación (patrón outbox). Consumido por: ServicioGeoespacial (projector), ServicioAuditoria, ServicioNotificaciones.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["eventId", "eventType", "version", "occurredAt", "correlationId", "reportId", "data"],
+  "properties": {
+    "eventId":       { "type": "string", "format": "uuid" },
+    "eventType":     { "const": "reporte.creado" },
+    "version":       { "const": 1 },
+    "occurredAt":    { "type": "string", "format": "date-time" },
+    "correlationId": { "type": "string", "format": "uuid" },
+    "reportId":      { "type": "string", "format": "uuid" },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actorId", "municipioId", "categoria", "lat", "lon"],
+      "properties": {
+        "actorId":     { "type": "string", "format": "uuid" },
+        "municipioId": { "type": "string", "format": "uuid" },
+        "categoria":   { "enum": ["hueco_via", "fuga_agua", "alumbrado", "arbolado", "otro"] },
+        "lat":         { "type": "number", "minimum": -90, "maximum": 90 },
+        "lon":         { "type": "number", "minimum": -180, "maximum": 180 }
+      }
+    }
+  }
+}

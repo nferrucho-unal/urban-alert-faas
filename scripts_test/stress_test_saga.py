@@ -5,6 +5,7 @@ import threading
 import time
 import uuid
 import pika
+from eventos import evento_multimedia_upload, evento_reporte_creado
 
 # Parámetros de conexión AMQP
 BROKER_LOCAL = "amqp://urban_user:urban_secure_pass@localhost:5672/%2F"
@@ -24,19 +25,27 @@ def enviar_evento_worker(worker_id, start_idx, num_eventos, correlation_id_base)
         channel = connection.channel()
 
         # Asegurar la existencia del exchange en el broker
-        channel.exchange_declare(exchange=EXCHANGE_NAME, exchange_type="topic")
+        channel.exchange_declare(exchange=EXCHANGE_NAME, exchange_type="topic", durable=True)
+        actor_id = str(
+            uuid.uuid5(uuid.NAMESPACE_URL, f"urban-alert-stress-worker-{worker_id}")
+        )
 
         for i in range(num_eventos):
             current_idx = start_idx + i
-            report_id = f"REP-2026-STRESS-{current_idx}"
-            correlation_id = f"{correlation_id_base}-{current_idx}"
+            report_id = str(uuid.uuid4())
+            correlation_id = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"{correlation_id_base}-{current_idx}",
+                )
+            )
 
             # Construcción de los payloads transaccionales y multimedia
-            payload_reporte = {
-                "reportId": report_id,
-                "actor": f"Stress_Worker_{worker_id}",
-                "descripcion": "Simulación masiva de colapso de infraestructura vial.",
-            }
+            payload_reporte = evento_reporte_creado(
+                report_id=report_id,
+                correlation_id=correlation_id,
+                actor_id=actor_id,
+            )
 
             propiedades = pika.BasicProperties(
                 correlation_id=correlation_id,
@@ -53,11 +62,12 @@ def enviar_evento_worker(worker_id, start_idx, num_eventos, correlation_id_base)
             )
 
             # 2. Inyectar evento paralelo para el Servicio Multimedia
-            payload_multimedia = {
-                "reportId": report_id,
-                "bucket": "urban-alert-evidencias-bogota",
-                "objectKey": f"reportes/fotos/evidencia_stress_{current_idx}.jpg",
-            }
+            payload_multimedia = evento_multimedia_upload(
+                report_id=report_id,
+                correlation_id=correlation_id,
+                bucket="urban-alert-evidencias-bogota",
+                object_key=f"reportes/{report_id}/evidencia_stress_{current_idx}.jpg",
+            )
             channel.basic_publish(
                 exchange=EXCHANGE_NAME,
                 routing_key="multimedia.upload",
