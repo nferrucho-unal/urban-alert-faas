@@ -65,6 +65,8 @@ Puertos locales principales:
 | --- | ---: |
 | RabbitMQ AMQP | `5672` |
 | RabbitMQ Management | `15672` |
+| SMTP local (Mailpit) | `1025` |
+| Bandeja Mailpit | `8025` |
 | S3 local compatible (SeaweedFS) | `8333` |
 | Consola SeaweedFS (UI) | `9333` |
 | Redis | `6379` |
@@ -150,6 +152,14 @@ PostgreSQL cuando ya existe perfil, por lo que los cambios de rol son efectivos
 en la siguiente solicitud aunque el token no haya expirado. Nunca se confía en un
 `X-User-Context` enviado por el cliente.
 
+Notificaciones resuelve el email del propietario del reporte desde Core con el
+rol de solo lectura `notification_reader` y envía correo mediante SMTP. En
+Compose, Mailpit captura los mensajes en <http://localhost:8025> sin entregarlos
+a destinatarios externos. Para producción, configura `SMTP_HOST`, `SMTP_PORT`,
+`SMTP_FROM_EMAIL`, `SMTP_STARTTLS=true`, `SMTP_USERNAME` y `SMTP_PASSWORD` con
+credenciales de un relay como Amazon SES SMTP o SendGrid; guarda las credenciales
+en el gestor de secretos del despliegue, no en Compose ni en el repositorio.
+
 API Gateway inyecta `X-Urban-Gateway-Key`; el backend rechaza cualquier solicitud
 sin la clave constante configurada como `gateway_shared_secret`. Esto impide usar
 el endpoint público de App Runner como bypass de Gateway/WAF. Provisiona el valor
@@ -232,7 +242,7 @@ Cada script valida un comportamiento distinto:
 - `publicar_evento_saga.py`: flujo feliz de la saga y propagación de eventos.
 - `test_idempotency_saga.py`: detección de un mensaje duplicado mediante Redis.
 - `test_multimedia_nosql.py`: publica un evento multimedia y verifica su metadata en MongoDB.
-- `test_notifications_redis.py`: publica un reporte y valida idempotencia/estado con TTL en Redis.
+- `test_notifications_redis.py`: publica un reporte, comprueba el correo capturado por Mailpit e idempotencia/estado con TTL en Redis; requiere Core, RabbitMQ, Redis y Mailpit activos.
 - `test_dlq_routing.py`: publicación de eventos para validar el enrutamiento a DLQ.
 - `verify_core_replication.py`: escritura en la primaria, lectura en la réplica y bloqueo de escrituras en standby.
 

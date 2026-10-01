@@ -34,6 +34,13 @@ services:
       timeout: 3s
       retries: 3
 
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+
   mongodb:
     image: mongo:7.0
     container_name: urban_alert_nosql
@@ -226,11 +233,12 @@ services:
     image: postgres:16-alpine
     restart: "no"
     entrypoint: ["sh", "-c"]
-    command: ["psql -h core_db_primary -U core_admin -d urban_alert_core -v ON_ERROR_STOP=1 -f /migrations/002_business_services.sql"]
+    command: ["psql -h core_db_primary -U core_admin -d urban_alert_core -v ON_ERROR_STOP=1 -f /migrations/002_business_services.sql -f /migrations/003_notification_reader.sql"]
     environment:
       - PGPASSWORD=core_secure_pass
     volumes:
       - ./core_init/002_business_services.sql:/migrations/002_business_services.sql:ro
+      - ./core_init/003_notification_reader.sql:/migrations/003_notification_reader.sql:ro
     depends_on:
       core_db_primary:
         condition: service_healthy
@@ -313,12 +321,21 @@ services:
     environment:
       - BROKER_URL=amqp://urban_user:urban_secure_pass@rabbitmq:5672/%2F
       - REDIS_URL=redis://redis:6379/0
+      - NOTIFICATION_DATABASE_URL=postgresql://notification_reader:notification_reader_secure_pass@core_db_primary:5432/urban_alert_core
+      - SMTP_HOST=mailpit
+      - SMTP_PORT=1025
+      - SMTP_FROM_EMAIL=notificaciones@urban-alert.local
+      - SMTP_STARTTLS=false
       - PYTHONPATH=/app
     depends_on:
       rabbitmq:
         condition: service_healthy
       redis:
         condition: service_healthy
+      core_migrate:
+        condition: service_completed_successfully
+      mailpit:
+        condition: service_started
 
   fn_audit:
     build: .
