@@ -13,15 +13,11 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # FASE 1: INTEGRACIÓN CONTINUA (CI) - Matrix Testing en Paralelo (QAS-01.2)
+  # FASE 1: INTEGRACIÓN CONTINUA (CI) - Contratos y servicios (QAS-01.2)
   # ---------------------------------------------------------------------------
   test:
-    name: Pruebas Unitarias y Validación de Esquemas
+    name: Contratos y pruebas unitarias de Core/FaaS
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        # Se ejecutan de forma paralela las pruebas de los 3 microservicios FaaS
-        component: [fn_notifications, fn_audit, fn_multimedia]
     steps:
       - name: Descargar Código Fuente
         uses: actions/checkout@v4
@@ -32,21 +28,18 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
-      - name: Instalar Dependencias Globales y de Componente
+      - name: Instalar dependencias del proyecto
         run: |
-          pip install --upgrade pip pytest requests pika redis psycopg2-binary
-          if [ -f ${{ matrix.component }}/requirements.txt ]; then
-            pip install -r ${{ matrix.component }}/requirements.txt
-          fi
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
 
-      - name: Ejecutar Suite de Pruebas (Pytest)
-        # Quality Gate: Si falla una validación criptográfica o de esquema, el pipeline aborta de inmediato (Pág 15)
+      - name: Validar contratos versionados
         run: |
-          cd ${{ matrix.component }}
-          if [ -d "tests" ] || [ -f "test_app.py" ] || [ -f "app.py" ]; then
-            echo "Ejecutando verificaciones para ${{ matrix.component }}..."
-            # Aquí se ejecutarían tus archivos test_xxxx.py locales con pytest
-          fi
+          python validar/validar_contratos.py
+
+      - name: Ejecutar pruebas unitarias de Core y consumidores
+        run: |
+          python -m unittest discover -s scripts_test -p "test_*.py" -v
 
   # ---------------------------------------------------------------------------
   # FASE 2: DESPLIEGUE CONTINUO (CD) - Terraform con Autenticación OIDC (IaC)

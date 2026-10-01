@@ -39,6 +39,26 @@ Esperar a que RabbitMQ y las bases estén saludables y confirmar que los consumi
 
 No usar `docker compose down -v`: borra los volúmenes persistentes y no es necesario para estas pruebas.
 
+### Diagnóstico de arranque Docker
+
+Durante la puesta en marcha aparecieron estos errores y se corrigieron:
+
+- `core_db_primary` no cargaba el HBA personalizado porque el path del `include`
+  estaba entre comillas como parte literal del nombre. Se corrigió la directiva.
+- La réplica no tenía permiso de replicación en `pg_hba.conf` y luego encontró
+  permisos inválidos en el volumen vacío. Se añadió una regla `samenet`; el
+  entrypoint ajusta ownership/permisos y ejecuta `pg_basebackup` y PostgreSQL
+  como el usuario sin privilegios `postgres`.
+- El healthcheck de RabbitMQ vencía mientras el broker completaba su arranque.
+  Se amplió `start_period` a 180 s, `timeout` a 15 s e `interval` a 15 s.
+- Compose informa un contenedor antiguo huérfano `seaweed_s3` en `Exited (137)`.
+  No bloquea el stack actual: `seaweed-s3` está `Up`. No se eliminó el huérfano.
+
+En `docker compose ps`, `core_migrate`, `audit_migrate`, `postgis_migrate` y
+`s3_init` en `Exited (0)` indican tareas de inicialización completadas, no
+fallidas. Los servicios persistentes deben quedar `Up`; RabbitMQ, Redis,
+PostgreSQL, PostGIS, MongoDB y Mailpit deben quedar `healthy`.
+
 ## Flujo feliz
 
 El perfil se crea/actualiza por la API local usando un UUID de identidad reservado para pruebas y un dominio `.test`. `X-User-Context` solo está habilitado por la configuración local de desarrollo.
@@ -162,6 +182,11 @@ La prueba controlada anterior leyó el mensaje de la DLQ y lo devolvió con `nac
 | Idempotencia | OK. Reenvío conserva el estado Redis y el consumidor omite el duplicado. |
 | Falla SMTP / reintentos / DLQ | OK. Reporte `3a307254-9a39-4493-9bb4-af22641a75d9`; 3 intentos; evento `f2100b9c-afca-4149-9a06-eecdcca7c1c5` llegó a `q_dead_letter_notifications`. |
 | PostgreSQL réplica y RabbitMQ | OK. La réplica quedó `healthy` y transmitiendo WAL; RabbitMQ `healthy`. |
+| Head de auditoría | OK. El head coincidía con el hash del evento más reciente; había 10 eventos en el store al hacer la consulta. |
+| Estado actual de DLQ | `q_dead_letter_notifications` está vacía después de la prueba y de restaurar el consumidor normal; el mensaje de prueba se observó en DLQ durante la ejecución. |
+
+Estado Docker consultado al documentar: servicios persistentes y consumidores
+`Up`; dependencias principales `healthy`; tareas de migración con salida 0.
 
 Las pruebas unitarias complementarias siguen disponibles en `scripts_test/test_audit_persistence.py`, `scripts_test/test_audit_persistence_db.py`, `scripts_test/test_audit_api.py` y `scripts_test/test_contract_consumers.py`.
 

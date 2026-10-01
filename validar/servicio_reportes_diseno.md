@@ -2,7 +2,7 @@
 
 Este documento resuelve los 7 puntos abiertos para construir `ServicioReportes`, coherente con la arquitectura del DSL (`LoadBalancer -> ServicioReportes`, patrón *Publish/Subscribe* sobre RabbitMQ) y con el objetivo de calidad citado en `delivery3-team-C-revisión.md:160` (p95 < 150 ms, cero reportes perdidos en picos) y `delivery3-team-C-revisión.md:210` (aislar las consultas geoespaciales de la creación de reportes).
 
-> **Estado real del repositorio (confirmado por inspección de código, no supuesto):** `reportes_core` hoy solo tiene `id`, `descripcion`, `estado` y `fecha_creacion`; PostGIS tiene una tabla aparte con tipo de daño/estado/ubicación con algunos datos de prueba, y su usuario configurado es de **solo lectura**. Terraform ya define un `core_app_runner` + API Gateway para desplegar la API Core (`main.tf:82`), pero el repositorio no tiene esa implementación y `docker-compose.yml` **no levanta ningún backend Core** hoy — solo las bases de datos y los consumidores FaaS. Lo que sigue es el diseño objetivo; las secciones 2 y 3 marcan explícitamente qué es "ya existe" y qué hay que agregar.
+> **Estado actualizado del repositorio (2026-09-30):** Core está implementado en `core_services/` y Docker Compose levanta la API, el relay outbox, el projector geoespacial y los consumidores. `core_init/002_business_services.sql`, `003_notification_reader.sql` y `postgis_init/002_reportes_geo.sql` definen las migraciones locales. PostGIS es una proyección asíncrona y separada. Esta especificación conserva decisiones y metas de diseño; el estado de pruebas medido se registra en `FlujoCompleto.md`.
 
 ---
 
@@ -15,9 +15,9 @@ Este documento resuelve los 7 puntos abiertos para construir `ServicioReportes`,
 | `ciudadano` | `IdentityProvider` (OIDC) | Crear, consultar y listar **sus propios** reportes |
 | `gestor` | `IdentityProvider` | Consultar/listar todos los reportes de su municipio, transicionar estado |
 | `admin` | `IdentityProvider` | Todo lo anterior sin restricción de municipio |
-| `sistema` (service-to-service) | client credentials | Actualizar `estado` desde `ServicioObras` (p. ej. al asignar una obra) |
+| `sistema` (service-to-service) | client credentials | Puede usar las transiciones soportadas por la API de estados; la asignación de obra actual se expone a `gestor`/`admin` |
 
-Todas las rutas pasan por el `ApiGateway` (JWT ya verificado) y llegan al servicio con los claims `sub`, `role`, `municipio_id` en un header interno (`X-User-Context`) inyectado por el gateway — el servicio **no** vuelve a llamar al IdP.
+En producción, API Gateway aplica Cognito y añade `X-Urban-Gateway-Key`; Core verifica RS256, issuer, cliente, expiración y `token_use`, y resuelve el rol y municipio autorizados desde Core. `X-User-Context` solo está habilitado para pruebas locales (`ALLOW_TEST_USER_CONTEXT=true`), no como identidad de producción.
 
 ### 1.2 Endpoints
 
@@ -25,11 +25,12 @@ Todas las rutas pasan por el `ApiGateway` (JWT ya verificado) y llegan al servic
 |---|---|---|
 | `POST /reportes` | `ciudadano` | Crea un reporte en estado `RECIBIDO` |
 | `GET /reportes/{id}` | `ciudadano` (dueño) / `gestor` / `admin` | Consulta un reporte |
-| `GET /reportes?zona=&estado=&categoria=&desde=&hasta=&cursor=` | `gestor` / `admin` | Lista/filtra por zona (bounding box `bbox=minLon,minLat,maxLon,maxLat`), estado, categoría y rango de fechas; paginado por cursor |
+| `GET /reportes?bbox=&estado=&categoria=&desde=&hasta=&cursor=` | `gestor` / `admin` | Lista/filtra por bounding box `bbox=minLon,minLat,maxLon,maxLat`, estado, categoría y rango de fechas; paginado por cursor |
 | `PATCH /reportes/{id}/estado` | `gestor` / `admin` / `sistema` | Transiciona el estado (body: `{estado, motivo}`) |
 | `POST /reportes/{id}/multimedia` | `ciudadano` (dueño) | Registra una referencia a un archivo ya subido vía URL prefirmada (ver §5) |
+| `POST /reportes/{id}/multimedia/upload-url` | `ciudadano` (dueño) | Crea una carga temporal presignada en S3/SeaweedFS |
 
-`GET /reportes?zona=` **no consulta PostGIS directamente desde este servicio**: reenvía la porción espacial a `ServicioGeoespacial` (ver §3) y combina el resultado con los metadatos de Core. Esto es lo que mantiene aislada la consulta geoespacial de la ruta de escritura.
+La implementación usa `bbox` (no `zona`): Core reenvía el filtro espacial a `ServicioGeoespacial` y restringe sus metadatos a los IDs recibidos. Así se mantiene aislada la consulta geoespacial de la ruta de escritura.
 
 ### 1.3 Campos obligatorios de creación (`POST /reportes`)
 
@@ -43,7 +44,7 @@ Todas las rutas pasan por el `ApiGateway` (JWT ya verificado) y llegan al servic
 }
 ```
 
-`actor_id` **no** viaja en el body: se toma del `X-User-Context` para evitar suplantación.
+`actor_id` **no** viaja en el body: se toma del contexto autenticado para evitar suplantación.
 
 ### 1.4 Máquina de estados
 
@@ -54,8 +55,9 @@ RECIBIDO ──validar──> VALIDADO ──asignar──> EN_OBRA ──cerrar
 ```
 
 - Transiciones válidas se aplican con `estado_actual → estado_nuevo` en una tabla de reglas en código (no en la BD); cualquier otra combinación devuelve `409 Conflict`.
-- Solo `gestor`/`admin`/`sistema` transicionan; `ciudadano` solo lee.
-- Cada transición genera una fila en `reporte_historial_estado` (append-only) y, si corresponde, un evento (`reporte.validado`, `obra.asignada`, `reporte.resuelto`).
+- Solo `gestor`/`admin`/`sistema` transicionan; el ciudadano puede crear y consultar sus reportes, pero no cambiar su estado.
+- Cada transición genera una fila en `reporte_historial_estado` y el evento correspondiente en outbox dentro de la transacción. La ruta de estado publica `reporte.validado`, `reporte.rechazado` o `reporte.resuelto`; `POST /obras` establece `EN_OBRA` y publica `obra.asignada`.
+- **Brecha de autorización:** aunque la tabla y la transición contemplan `sistema`, `POST /obras` hoy requiere `gestor` o `admin`; el acceso service-to-service de Obras no está implementado en esa ruta.
 
 ### 1.5 Respuestas de error (uniformes)
 
@@ -79,7 +81,7 @@ RECIBIDO ──validar──> VALIDADO ──asignar──> EN_OBRA ──cerrar
 
 ### 2.1 Core — PostgreSQL (`reportes_core`, escritura autoritativa)
 
-**Hoy existe** `reportes_core(id, descripcion, estado, fecha_creacion)`. Lo que sigue es una migración que **agrega** columnas sobre esa tabla — no la reemplaza — más dos tablas nuevas de apoyo:
+El esquema implementado conserva la tabla `reportes_core` y agrega `categoria`, `actor_id`, `municipio_id`, `lat`, `lon`, `correlation_id` y `actualizado_en`, además de historial, multimedia y outbox. La migración vigente es `core_init/002_business_services.sql`; la tabla identifica al reporte por `report_id`.
 
 ```sql
 ALTER TABLE reportes_core
@@ -102,6 +104,7 @@ CREATE INDEX ix_reportes_actor ON reportes_core(actor_id);
 
 `actor_id`, `municipio_id`, `lat/lon` y `correlation_id` quedan nulables en la migración (para no romper filas existentes) y se vuelven `NOT NULL` en una segunda migración una vez hecho el back-fill — o directamente `NOT NULL` si la tabla todavía no tiene datos de producción.
 
+```sql
 CREATE TABLE reporte_historial_estado (
     id            BIGSERIAL PRIMARY KEY,
     reporte_id    UUID NOT NULL REFERENCES reportes_core(id),
@@ -129,7 +132,7 @@ CREATE TABLE reporte_multimedia (
 
 ### 2.2 PostGIS (proyección de solo consulta)
 
-**Hoy existe** una tabla PostGIS con tipo de daño, estado y ubicación geográfica, con algunos datos de prueba, y el usuario de aplicación configurado sobre ella (`analista_obras`) es de **solo lectura**. El diseño objetivo — ya sea ampliando esa tabla o creando la siguiente en paralelo mientras se decide la migración — es:
+Compose inicializa `reportes_geo` con índice GiST. `analista_obras` conserva lectura para la API geoespacial; `svc_geo_projector` es el rol separado de escritura de la proyección. El esquema vigente es `postgis_init/002_reportes_geo.sql`:
 
 ```sql
 CREATE TABLE reportes_geo (
@@ -152,9 +155,9 @@ Esta tabla es una **réplica de lectura** poblada de forma asíncrona (§3), no 
 Postgres Core y PostGIS son bases **separadas** (confirmado en el DSL: `ServicioReportes → PostgreSQL` vs. `ServicioGeoespacial → PostGIS`, y confirmado en el repo: el rol `analista_obras` sobre PostGIS es de solo lectura). Se resuelve así, sin dos-phase-commit entre bases distintas:
 
 1. `POST /reportes` escribe **una sola transacción local** en Core: `reportes_core` + `reporte_historial_estado` + fila en `outbox_eventos` (ver §4). Postgres Core es la única fuente de verdad.
-2. Un **projector** asíncrono (proceso separado, o el propio `ServicioAuditoria` extendido) consume el evento `reporte.creado`/`reporte.actualizado` desde RabbitMQ y hace *upsert* en `reportes_geo` con un rol SQL de PostGIS **nuevo**, con `INSERT/UPDATE` acotado a esa tabla (`analista_obras` no se toca: sigue de solo lectura y sigue siendo el rol que usa `ServicioGeoespacial` para consultar).
+2. El projector asíncrono consume `reporte.creado` y `reporte.validado` desde RabbitMQ y actualiza `reportes_geo` con `svc_geo_projector`; `analista_obras` se mantiene de solo lectura.
 3. `ServicioGeoespacial` consulta exclusivamente `reportes_geo` con `analista_obras` (solo lectura) — nunca toca `reportes_core`. Esto es lo que aísla la ruta de consulta geoespacial de la ruta de creación (`delivery3-team-C-revisión.md:210`): un pico de consultas de mapa no compite por locks ni por pool de conexiones con la escritura de reportes nuevos. El límite de 50 conexiones ya configurado para PostGIS en `docker-compose.yml:119` reduce aún más ese riesgo de contención.
-4. Consecuencia aceptada: la proyección en PostGIS es *eventual* (retraso típico: el tiempo de un ciclo del projector, del orden de cientos de ms). Un reporte recién creado puede tardar un instante en aparecer en el mapa; el `GET /reportes/{id}` (que sí lee Core) es consistente de inmediato. El projector debe poder reintentar y reportar ubicaciones pendientes/fallidas (mismo mecanismo de reintentos acotados + DLQ de la Fase 0), para no dejar el mapa desactualizado en silencio si un evento falla repetidamente.
+4. La proyección en PostGIS es eventual: `GET /reportes/{id}` lee Core, mientras que el mapa puede tardar en reflejar un reporte. El projector reintenta fallos con contador Redis y envía a `q_dead_letter_geospatial` al quinto intento.
 
 ---
 
@@ -183,23 +186,29 @@ Un *relay* (poller cada ~200 ms, o `pg_logical`/Debezium si el equipo prefiere C
 ```json
 {
   "eventId": "uuid",
-  "type": "reporte.creado",
-  "reportId": "uuid",
-  "actorId": "uuid",
+  "eventType": "reporte.creado",
+  "version": 1,
+  "occurredAt": "2026-09-26T14:03:00Z",
   "correlationId": "uuid",
-  "municipioId": "uuid",
-  "categoria": "hueco_via",
-  "lat": 4.65, "lon": -74.05,
-  "occurredAt": "2026-09-26T14:03:00Z"
+  "reportId": "uuid",
+  "data": {
+    "actorId": "uuid",
+    "municipioId": "uuid",
+    "categoria": "hueco_via",
+    "lat": 4.65,
+    "lon": -74.05
+  }
 }
 ```
+
+El esquema versionado y los ejemplos válidos viven en `validar/schemas/` y `validar/ejemplos/`.
 
 `correlationId` es el mismo que generó el cliente en `POST /reportes` (§1.3): permite seguir un reporte de punta a punta entre `ServicioReportes`, `ServicioAuditoria` (Structured Logging + Correlation IDs, ya presente en el DSL) y `ServicioNotificaciones`.
 
 ### 4.3 Idempotencia
 
 - **En la creación:** `ux_reportes_correlation` (índice único, §2.1) hace que un reintento del cliente con el mismo `correlationId` devuelva el reporte ya creado (`200` con el recurso existente) en vez de duplicarlo.
-- **En los consumidores** (`ServicioNotificaciones`, `ServicioAuditoria`, el projector de PostGIS): cada uno guarda `eventId` procesados en Redis con TTL de 24 h (mismo mecanismo de idempotencia que ya usa `ServicioAuditoria` en el DSL) y descarta duplicados en `SETNX eventId`.
+- **En los consumidores:** Notificaciones y el projector usan claves Redis con TTL de 24 h; Auditoría deduplica por `eventId` con la restricción única del event store PostgreSQL. Todos validan eventos con los esquemas compartidos.
 
 ---
 
@@ -207,9 +216,9 @@ Un *relay* (poller cada ~200 ms, o `pg_logical`/Debezium si el equipo prefiere C
 
 `ServicioReportes` **no** recibe binarios. Flujo:
 
-1. Cliente llama `POST /reportes/{id}/multimedia/upload-url` → el servicio pide a `ServicioMultimedia` (o directamente a S3 con permisos de `PutObject` acotados) una URL prefirmada de un solo uso, de vigencia corta (p. ej. 5 min).
+1. Cliente llama `POST /reportes/{id}/multimedia/upload-url` → Core genera una URL POST presignada de vigencia corta (5 min en local/configuración actual) hacia S3/SeaweedFS.
 2. El cliente sube el archivo directo a Object Storage con esa URL (nunca pasa por `ServicioReportes` ni por `PostgreSQL`).
-3. Cliente confirma con `POST /reportes/{id}/multimedia` enviando `object_key` y `mime_type`; el servicio valida que el objeto exista (`HEAD` a S3) antes de insertar en `reporte_multimedia`.
+3. Cliente confirma con `POST /reportes/{id}/multimedia` enviando `uploadId`; Core valida HEAD, tamaño, metadatos y firma del contenido, promueve el objeto, persiste la referencia y `multimedia.upload` en outbox.
 
 Esto es exactamente el desacoplamiento de persistencia que ya contempla el escenario de escalabilidad del proyecto (evitar guardar archivos grandes en la base transaccional).
 
@@ -220,12 +229,12 @@ Esto es exactamente el desacoplamiento de persistencia que ya contempla el escen
 - **Validación de entrada:** cada campo del §1.3 se valida (tipo, rango, longitud, enum) **antes** de tocar la base — rechazo temprano con `400`, sin ejecutar ninguna consulta.
 - **Consultas parametrizadas siempre** (ORM o `psycopg2` con placeholders `%s`), nunca interpolación de strings — es la mitigación que ya aplica el WAF en el borde, pero el servicio no debe depender solo de esa capa (defensa en profundidad).
 - **Privilegio mínimo por base:**
-  - Rol `svc_reportes_core`: `SELECT, INSERT, UPDATE` únicamente sobre `reportes_core`, `reporte_historial_estado`, `reporte_multimedia`, `outbox_eventos`. Sin `DELETE`, sin acceso a otros schemas.
-  - Rol `svc_reportes_geo_projector` (nuevo): `INSERT, UPDATE` solo sobre `reportes_geo` (usado por el projector, no por `ServicioReportes` directamente, y no por `ServicioGeoespacial`).
+  - Core usa `app_core_user`; la migración actual concede operaciones de negocio sobre varias tablas Core y no `DELETE`/DDL.
+  - `svc_geo_projector` tiene escritura acotada a `reportes_geo`; `analista_obras` conserva lectura.
   - `analista_obras` **no cambia**: sigue siendo de solo lectura y sigue siendo el rol que consulta `ServicioGeoespacial`.
 - **Stateless:** el servicio no guarda sesión ni estado local; cualquier instancia detrás del `LoadBalancer` puede atender cualquier solicitud (coherente con la táctica `Stateless Services` ya modelada). La configuración de conexión (host/usuario/secreto de Postgres Core, PostGIS, Redis, RabbitMQ) llega por variables de entorno, una por dependencia, resueltas según el entorno (local vía `docker-compose.yml`, nube vía el mecanismo de secretos de App Runner).
 - **RBAC:** se aplica dos veces — grueso en el `ApiGateway` (¿el rol puede llegar a esta ruta?) y fino en el servicio (¿este `gestor` pertenece al `municipio_id` del reporte?).
-- **Brecha operativa a cerrar primero:** Terraform ya define `core_app_runner` + API Gateway (`main.tf:82`) para desplegar esta API en la nube, pero **el repositorio no tiene la implementación** y `docker-compose.yml` no levanta ningún backend Core hoy (solo bases de datos y consumidores FaaS). Antes de escribir pruebas de extremo a extremo locales hay que agregar un servicio de Core al `docker-compose.yml`.
+- **Estado de despliegue:** Core API sí corre localmente en Compose. Terraform define recursos de App Runner/API Gateway, pero las pruebas locales no certifican un despliegue productivo completo ni el cumplimiento de los SLO cloud.
 
 ---
 
@@ -246,4 +255,4 @@ Esto es exactamente el desacoplamiento de persistencia que ya contempla el escen
 | Resiliencia | Detener RabbitMQ tras el `COMMIT` de un `POST /reportes` | El evento queda en `outbox_eventos` con `publicado_en IS NULL`; al reiniciar el broker, el relay lo publica sin pérdida |
 | Rendimiento | Carga sostenida sobre `POST /reportes` (k6/locust) | p95 < 150 ms end-to-end, 0 respuestas 5xx, 0 eventos sin publicar al final de la corrida |
 
-La prueba de rendimiento y la de resiliencia son las que validan directamente el objetivo arquitectónico citado (`delivery3-team-C-revisión.md:160`): p95 < 150 ms y cero reportes perdidos durante picos.
+Los tests unitarios de productores/autorización están en `scripts_test/test_business_producers.py`; el flujo local medido y el caso SMTP/DLQ están en `FlujoCompleto.md`. Siguen pendientes una prueba de caída de RabbitMQ después del commit, la verificación de recuperación del outbox en ese escenario y un benchmark k6/Locust que mida p95 < 150 ms bajo carga. Por tanto, esos objetivos siguen siendo metas, no resultados certificados.

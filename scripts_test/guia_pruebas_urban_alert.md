@@ -1,134 +1,36 @@
-# GUÍA PRÁCTICA DE OPERACIÓN Y BANCO DE PRUEBAS DE ESTRÉS
-## PROYECTO: URBAN ALERT - CAPA FAAS (GRUPO C)
+# Índice de pruebas Urban Alert
 
-Este documento contiene la guía paso a paso para instalar, orquestar y validar las tácticas de arquitectura de la capa de Funciones como Servicio (FaaS), caché distribuida y mensajería asíncrona de **Urban Alert**.
+Esta carpeta contiene pruebas unitarias, pruebas que requieren infraestructura
+local y herramientas de carga. La guía principal de ejecución integrada y sus
+resultados está en [FlujoCompleto.md](../FlujoCompleto.md); los puertos,
+servicios y preparación del entorno están en [README.md](../README.md).
 
----
+## Quality gate local/CI
 
-## 1. PREPARACIÓN DEL ENTORNO LOCAL
+Desde la raíz del repositorio:
 
-Asegúrese de estructurar el directorio de su proyecto de la siguiente forma antes de iniciar:
-
-```text
-urban-alert-faas/
-│
-├── docker-compose.yml          # Orquestador central de infraestructura y FaaS
-├── Dockerfile                  # Imagen base optimizada de Python para las funciones
-├── requirements.txt            # Dependencias globales del ecosistema
-│
-├── postgis_init/               # Inicialización de la persistencia espacial
-│   └── init.sql
-│
-├── core_init/                  # Inicialización de la persistencia transaccional
-│   └── init.sql
-│
-├── fn_audit/                   # Código FaaS de Auditoría (QAS-04.1)
-│   └── app.py
-│
-├── fn_notifications/           # Código FaaS de Notificaciones (QAS-02)
-│   └── app.py
-│
-├── fn_multimedia/              # Código FaaS Multimedia (QAS-03)
-│   └── app.py
-│
-└── scripts_test/               # Banco unificado de pruebas distribuidas
-    ├── publicar_evento_saga.py
-    ├── test_idempotency_saga.py
-    ├── test_dlq_routing.py
-    ├── verify_core_replication.py
-    └── stress_test_saga.py
+```powershell
+python .\validar\validar_contratos.py
+python -m unittest discover -s scripts_test -p "test_*.py" -v
 ```
 
-### Contenido obligatorio de `requirements.txt`
-```text
-Flask==3.0.3
-requests==2.32.3
-pika==1.3.2
-redis==5.0.4
-psycopg2-binary==2.9.11
-pymongo==4.10.1
-```
+El primer comando valida esquemas y ejemplos de `validar/`. El segundo ejecuta
+las pruebas unitarias de Core y consumidores con dobles locales; no requiere
+levantar Docker.
 
----
+## Integración con Docker
 
-## 2. ORQUESTRACIÓN Y DESPLIEGUE CON DOCKER COMPOSE
+Con el stack activo, ejecuta la secuencia paso a paso, incluyendo API → outbox →
+RabbitMQ → PostGIS/Auditoría/Notificaciones, idempotencia, correo local y fallo
+SMTP con DLQ, en [FlujoCompleto.md](../FlujoCompleto.md).
 
-Para construir las imágenes personalizadas de las funciones FaaS y encender toda la topología interconectada (incluyendo las bases de datos primarias, réplicas, caché de Redis y clúster de RabbitMQ), abra una terminal en la raíz del proyecto y ejecute:
+`test_notifications_redis.py`, `test_audit_persistence_db.py`,
+`test_idempotency_saga.py`, `test_multimedia_nosql.py`, `test_dlq_routing.py` y
+`verify_core_replication.py` requieren los servicios externos indicados por
+cada script. `test_dlq_routing.py` publica eventos válidos; por sí solo no
+simula una falla del proveedor SMTP.
 
-```bash
-# Construir imágenes y levantar servicios en segundo plano (Detached Mode)
-docker compose up --build -d
-```
+## Carga
 
-### Validación de Salud de la Infraestructura (Health Checks)
-La topología implementa sondas de disponibilidad rígidas. Puede verificar que todos los servicios hayan pasado satisfactoriamente las pruebas de salud ejecutando:
-
-```bash
-docker compose ps
-```
-*Notificaciones espera a RabbitMQ y Redis; Multimedia espera a RabbitMQ y MongoDB. Los servicios que usan Core/PostGIS mantienen sus dependencias propias.*
-
----
-
-## 3. TELEMETRÍA Y LOGS ESTRUCTURADOS (FACTOR XI)
-
-Para auditar el comportamiento del sistema bajo el formato estructurado JSON exigido por la gobernanza de observabilidad, inspeccione los flujos unificados ejecutando:
-
-```bash
-# Ver los logs en vivo de todas las funciones FaaS en paralelo
-docker compose logs -f fn_audit fn_notifications fn_multimedia
-```
-
----
-
-## 4. BANCO DE PRUEBAS ARQUITECTÓNICAS (SCRIPTS_TEST)
-
-Abra una segunda terminal en su máquina local, asegúrese de tener activo su entorno virtual con las dependencias instaladas y ejecute secuencialmente los siguientes escenarios de prueba:
-
-### Escenario A: Flujo Feliz de la Saga Coreografiada asíncrona
-Simula al Core registrando un reporte de emergencia y subiendo una evidencia multimedia. Valida que el Core se libere de forma instantánea (< 150 ms) delegando el procesamiento pesado en background a las tres FaaS concurrentes.
-```bash
-python scripts_test/publicar_evento_saga.py
-```
-
-### Escenario B: Escudo de Idempotencia en Memoria (ADR-04)
-Inyecta un evento original y acto seguido envía un duplicado exacto con el mismo identificador de traza. Comprueba en los logs cómo **Redis** ataja la segunda petición en menos de 5 ms, bloqueando ejecuciones repetidas y protegiendo al ciudadano de tormentas de alertas.
-```bash
-python scripts_test/test_idempotency_saga.py
-```
-
-### Verificación de registro de notificación en Redis
-Confirma que el consumidor guarda el estado e idempotencia con TTL y no vuelve a procesar el mismo evento.
-```bash
-python scripts_test/test_notifications_redis.py
-```
-
-### Escenario C: Tolerancia a Fallos y Enrutamiento Automático a la DLQ (ADR-02)
-Genera reportes diseñados para simular la caída del proveedor externo de mensajería (SMS/Push). Valida en la consola de administración de RabbitMQ (`http://localhost:15672`) que los mensajes sean desviados de forma automática hacia la cola de fallos `q_dead_letter_notifications` tras agotar los 3 intentos.
-```bash
-python scripts_test/test_dlq_routing.py
-```
-
-### Escenario D: Auditoría de Redundancia Activa y RPO (QAS-06)
-Escribe un reporte de infraestructura crítica en la base transaccional primaria (Puerto 5431), espera unos milisegundos y consulta su existencia en la instancia réplica Standby (Puerto 5433). Evalúa que el RPO sea menor a un segundo.
-```bash
-python scripts_test/verify_core_replication.py
-```
-
----
-
-### Escenario E: Persistencia multimedia desacoplada (QAS-03)
-Publica un evento `multimedia.upload` y espera la metadata del objeto en MongoDB. El archivo queda en Object Storage y el consumidor no escribe directamente en PostgreSQL/PostGIS.
-```bash
-python scripts_test/test_multimedia_nosql.py
-```
-
-## 5. LABORATORIO DE ESTRÉS CONCURRENTE (PÍCOS 10X - QAS-03)
-
-Para evaluar la capacidad de elasticidad horizontal y absorción de carga ante desastres climáticos severos, lance la ráfaga masiva ejecutando:
-
-```bash
-python scripts_test/stress_test_saga.py
-```
-
-El script mantendrá una cadencia exacta de **500 eventos por segundo en paralelo** introduciendo tanto el evento transaccional como el multimedia. Monitoree el panel de control de RabbitMQ para auditar el drenado simultáneo de los workers FaaS sin registrar degradación o pérdida de consistencia en el sistema.
+`stress_test_saga.py` emite eventos a RabbitMQ para observar colas y consumo.
+No calcula p95 HTTP ni certifica por sí mismo los objetivos de rendimiento.
