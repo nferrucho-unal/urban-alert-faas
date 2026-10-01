@@ -16,10 +16,10 @@ services:
     # Sonda de salud de infraestructura: Verifica que el broker acepte conexiones
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
-      interval: 10s    # Cada cuánto tiempo evalúa
-      timeout: 5s     # Tiempo máximo de espera de respuesta
-      retries: 3      # Intentos permitidos antes de marcar 'unhealthy'
-      start_period: 15s # Ventana inicial de gracia para el arranque del servicio
+      interval: 15s
+      timeout: 15s
+      retries: 5
+      start_period: 180s
 
   # 2. ALMACÉN CLAVE-VALOR EN MEMORIA (Redis)
   redis:
@@ -68,11 +68,12 @@ services:
     image: postgres:16-alpine
     restart: "no"
     entrypoint: ["sh", "-c"]
-    command: ["psql -h audit_db -U audit_admin -d urban_alert_audit -v ON_ERROR_STOP=1 -f /migrations/001_audit_store.sql"]
+    command: ["psql -h audit_db -U audit_admin -d urban_alert_audit -v ON_ERROR_STOP=1 -f /migrations/001_audit_store.sql -f /migrations/002_audit_reader.sql"]
     environment:
       - PGPASSWORD=audit_admin_secure_pass
     volumes:
       - ./audit_init/001_audit_store.sql:/migrations/001_audit_store.sql:ro
+      - ./audit_init/002_audit_reader.sql:/migrations/002_audit_reader.sql:ro
     depends_on:
       audit_db:
         condition: service_healthy
@@ -118,9 +119,11 @@ services:
       -c wal_level=replica 
       -c max_wal_senders=5 
       -c max_connections=100
+      -c hba_file=/etc/postgresql/pg_hba.replica.conf
     volumes:
       - core_primary_data:/var/lib/postgresql/data
       - ./core_init:/docker-entrypoint-initdb.d
+      - ./core_init/pg_hba.replica.conf:/etc/postgresql/pg_hba.replica.conf:ro
     # Sonda que garantiza que la base transaccional esté lista para recibir conexiones SQL
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U core_admin -d urban_alert_core"]
@@ -138,6 +141,7 @@ services:
       - POSTGRES_USER=core_admin
       - POSTGRES_PASSWORD=core_secure_pass
       - POSTGRES_DB=urban_alert_core
+      - PGPASSWORD=core_secure_pass
     # Dependencia estricta de la condición de salud (No arranca hasta que la primaria esté 'healthy')
     depends_on:
       core_db_primary:
@@ -145,10 +149,12 @@ services:
     command: >
       sh -c "
       until pg_isready -h core_db_primary -p 5432; do echo waiting for primary; sleep 1; done;
+      chown -R postgres:postgres /var/lib/postgresql/data;
+      chmod 700 /var/lib/postgresql/data;
       if [ ! -s /var/lib/postgresql/data/PG_VERSION ]; then
-        pg_basebackup -h core_db_primary -D /var/lib/postgresql/data -U core_admin -Fp -Xs -R;
+        gosu postgres pg_basebackup -h core_db_primary -D /var/lib/postgresql/data -U core_admin -Fp -Xs -R;
       fi;
-      exec postgres -c hot_standby=on
+      exec gosu postgres postgres -c hot_standby=on
       "
     volumes:
       - core_replica_data:/var/lib/postgresql/data
@@ -193,6 +199,7 @@ services:
       - ./validar:/app/validar:ro
     environment:
       - DATABASE_PRIMARY_URL=postgresql://app_core_user:app_secure_pass@core_db_primary:5432/urban_alert_core
+      - AUDIT_READ_DATABASE_URL=postgresql://audit_reader:audit_reader_secure_pass@audit_db:5432/urban_alert_audit
       - GEOSPATIAL_API_URL=http://service_geospatial:5000
       - S3_BUCKET=urban-alert-evidencias
       - S3_ENDPOINT_URL=http://seaweed-s3:8333
@@ -209,6 +216,8 @@ services:
       - PYTHONPATH=/app
     depends_on:
       core_migrate:
+        condition: service_completed_successfully
+      audit_migrate:
         condition: service_completed_successfully
       s3_init:
         condition: service_completed_successfully
@@ -303,19 +312,20 @@ services:
     command: ["python", "app.py"]
     environment:
       - BROKER_URL=amqp://urban_user:urban_secure_pass@rabbitmq:5672/%2F
-      - AUDIT_DATABASE_URL=postgresql://audit_writer:audit_writer_secure_pass@audit_db:5432/urban_alert_audit
+      - REDIS_URL=redis://redis:6379/0
       - PYTHONPATH=/app
     depends_on:
       rabbitmq:
         condition: service_healthy
-      audit_migrate:
-        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
 
   fn_audit:
     build: .
     restart: always
     volumes:
       - ./fn_audit:/app
+      - ./core_services:/app/core_services:ro
       - ./validar:/app/validar:ro
     command: ["python", "app.py"]
     environment:

@@ -159,6 +159,28 @@ class BusinessProducerTests(unittest.TestCase):
                 },
             ),
             create_event(
+                "reporte.rechazado",
+                REPORT_ID,
+                CORRELATION_ID,
+                {
+                    "actorId": ACTOR_ID,
+                    "municipioId": MUNICIPALITY_ID,
+                    "estadoPrevio": "RECIBIDO",
+                    "estadoNuevo": "RECHAZADO",
+                },
+            ),
+            create_event(
+                "reporte.resuelto",
+                REPORT_ID,
+                CORRELATION_ID,
+                {
+                    "actorId": ACTOR_ID,
+                    "municipioId": MUNICIPALITY_ID,
+                    "estadoPrevio": "EN_OBRA",
+                    "estadoNuevo": "RESUELTO",
+                },
+            ),
+            create_event(
                 "usuario.rol_cambiado",
                 None,
                 CORRELATION_ID,
@@ -327,6 +349,40 @@ class BusinessProducerTests(unittest.TestCase):
         )
         event = json.loads(outbox_insert[2])
         self.assertEqual(validate_event(event)["eventType"], "obra.asignada")
+
+    def test_reject_and_resolve_transitions_produce_audit_events(self):
+        test_cases = [
+            ("RECIBIDO", "RECHAZADO", "reporte.rechazado"),
+            ("EN_OBRA", "RESUELTO", "reporte.resuelto"),
+        ]
+        for current_status, new_status, expected_event_type in test_cases:
+            with self.subTest(status=new_status):
+                report = {
+                    "report_id": REPORT_ID,
+                    "estado": current_status,
+                    "municipio_id": MUNICIPALITY_ID,
+                    "correlation_id": CORRELATION_ID,
+                }
+                connection = FakeConnection([])
+                connection.fake_cursor = FakeCursor(report_row=report)
+                with patch.object(
+                    reports_service,
+                    "database_connection",
+                    return_value=connection,
+                ):
+                    response = self.client.patch(
+                        f"/reportes/{REPORT_ID}/estado",
+                        headers=user_context("gestor"),
+                        json={"estado": new_status, "motivo": "Verificado"},
+                    )
+                self.assertEqual(response.status_code, 200)
+                outbox_params = next(
+                    params
+                    for query, params in connection.fake_cursor.statements
+                    if "INSERT INTO outbox_eventos" in query
+                )
+                event = validate_event(json.loads(outbox_params[2]))
+                self.assertEqual(event["eventType"], expected_event_type)
 
     def test_outbox_marks_published_only_after_broker_publish(self):
         event = create_event(

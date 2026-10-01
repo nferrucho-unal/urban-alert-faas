@@ -64,8 +64,6 @@ class ConsumerContractTests(unittest.TestCase):
         return channel.actions
 
     def test_audit_valid_invalid_and_unknown_version(self):
-        audit.EVENT_STORE.clear()
-        audit.EVENT_IDS.clear()
         valid_events = [
             evento_reporte_creado(),
             json.loads(
@@ -93,9 +91,25 @@ class ConsumerContractTests(unittest.TestCase):
                 ).read_text(encoding="utf-8")
             ),
         ]
-        for event in valid_events:
-            self.assertEqual(self.invoke(audit.callback_auditoria, event), [("ack", 7)])
-        self.assertEqual(len(audit.EVENT_STORE), len(valid_events))
+        with patch.object(
+            audit,
+            "persistir_evento_auditoria",
+            side_effect=lambda event: {
+                "eventId": event["eventId"],
+                "reportId": event["reportId"],
+                "evento": event["eventType"],
+                "actorId": event["data"]["actorId"],
+                "correlationId": event["correlationId"],
+                "occurredAt": event["occurredAt"],
+                "hash_anterior": "0" * 64,
+                "hash": "1" * 64,
+            },
+        ) as persist_event:
+            for event in valid_events:
+                self.assertEqual(
+                    self.invoke(audit.callback_auditoria, event), [("ack", 7)]
+                )
+        self.assertEqual(persist_event.call_count, len(valid_events))
 
         invalid = dict(valid_events[0])
         invalid.pop("data")

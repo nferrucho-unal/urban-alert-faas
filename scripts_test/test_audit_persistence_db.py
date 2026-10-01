@@ -43,8 +43,10 @@ def main():
 
     first_result = persistir_evento_auditoria(EVENT)
     replay_result = persistir_evento_auditoria(EVENT)
-    if replay_result is not None:
-        raise AssertionError("Un eventId repetido no debe insertarse dos veces.")
+    if first_result is None or replay_result is None:
+        raise AssertionError("La persistencia debe devolver el registro para reintentar el archivo.")
+    if first_result["hash"] != replay_result["hash"]:
+        raise AssertionError("La reentrega debe conservar el hash del registro existente.")
 
     with psycopg2.connect(dsn) as connection:
         with connection.cursor() as cursor:
@@ -67,12 +69,51 @@ def main():
     assert payload["eventId"] == EVENT["eventId"]
     assert len(stored[1]) == 64
     assert len(stored[2]) == 64
+    assert stored[1].strip() == replay_result["hash_anterior"]
+    assert stored[2].strip() == replay_result["hash"]
     assert count == 1
     print(
         f"[OK] durable eventId={EVENT['eventId']} "
-        f"inserted={first_result is not None} replay_inserted={replay_result is not None} "
+        f"inserted={first_result is not None} replay_hash={replay_result['hash']} "
         f"rows={count} hash={stored[2]}"
     )
+
+    for event_type in ("reporte.rechazado", "reporte.resuelto"):
+        example_path = (
+            PROJECT_ROOT
+            / "validar"
+            / "ejemplos"
+            / f"{event_type}.v1.example.json"
+        )
+        event = validate_event(
+            json.loads(example_path.read_text(encoding="utf-8")), event_type
+        )
+        first_record = persistir_evento_auditoria(event)
+        replay_record = persistir_evento_auditoria(event)
+        if first_record["hash"] != replay_record["hash"]:
+            raise AssertionError(f"Hash inestable en la reentrega de {event_type}.")
+
+        with psycopg2.connect(dsn) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT payload, previous_hash, record_hash FROM audit_events WHERE event_id = %s",
+                    (event["eventId"],),
+                )
+                stored_contract = cursor.fetchone()
+                cursor.execute(
+                    "SELECT count(*) FROM audit_events WHERE event_id = %s",
+                    (event["eventId"],),
+                )
+                contract_count = cursor.fetchone()[0]
+
+        assert stored_contract is not None
+        assert contract_count == 1
+        assert stored_contract[1].strip() == replay_record["hash_anterior"]
+        assert stored_contract[2].strip() == replay_record["hash"]
+        print(
+            f"[OK] durable eventType={event_type} eventId={event['eventId']} "
+            f"rows={contract_count} hash={stored_contract[2]}"
+        )
 
 
 if __name__ == "__main__":

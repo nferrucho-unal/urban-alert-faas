@@ -2,6 +2,7 @@ import os
 
 from flask import Flask, jsonify
 
+from core_services.audit_api import audit_api
 from core_services.common import install_request_context, register_error_handlers
 from core_services.reports import reports
 from core_services.users import users
@@ -15,6 +16,7 @@ def create_app():
     app.register_blueprint(reports)
     app.register_blueprint(users)
     app.register_blueprint(works)
+    app.register_blueprint(audit_api)
 
     @app.get("/health")
     def health():

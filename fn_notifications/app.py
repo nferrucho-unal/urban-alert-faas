@@ -23,7 +23,12 @@ MAX_PROVIDER_ATTEMPTS = 3
 CIRCUIT_FAILURE_THRESHOLD = 3
 CIRCUIT_COOLDOWN_SECONDS = 4
 BASE_RETRY_DELAY_SECONDS = 0.2
-NOTIFICATION_EVENT_TYPES = {"reporte.creado", "obra.asignada"}
+NOTIFICATION_EVENT_TYPES = {
+    "reporte.creado",
+    "reporte.rechazado",
+    "reporte.resuelto",
+    "obra.asignada",
+}
 
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 provider_failure_count = 0

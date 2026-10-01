@@ -33,12 +33,14 @@ Cualquier `eventType` nuevo, o un cambio de `version` sobre uno existente, se pr
 - Fecha límite para comentarios: <fecha>
 ```
 
-Regla de aprobación: **al menos un representante de cada equipo consumidor conocido** confirma el RFC antes de mergear el esquema a `contratos/eventos/schemas/`. Para los 5 eventos ya definidos en `schemas/`, los consumidores conocidos son:
+Regla de aprobación: **al menos un representante de cada equipo consumidor conocido** confirma el RFC antes de mergear el esquema a `validar/schemas/`. Los consumidores conocidos son:
 
 | Evento | Productor | Consumidores |
 |---|---|---|
 | `reporte.creado` v1 | Reportes | Geoespacial (projector), Auditoría, Notificaciones |
 | `reporte.validado` v1 | Reportes | Obras, Auditoría |
+| `reporte.rechazado` v1 | Reportes | Auditoría, Notificaciones |
+| `reporte.resuelto` v1 | Reportes | Auditoría, Notificaciones |
 | `obra.asignada` v1 | Obras | Notificaciones, Auditoría |
 | `multimedia.upload` v1 | Multimedia | `fn_multimedia` |
 | `usuario.rol_cambiado` v1 | Usuarios | Auditoría, (opcional) Obras |

@@ -1,12 +1,15 @@
-import hashlib
 import json
 import logging
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 
+import boto3
 import pika
 import psycopg2
+from botocore.exceptions import ClientError
 from psycopg2.extras import Json
+from core_services.audit_integrity import calcular_hash_evento
 
 from validar.event_contracts import (
     ContractValidationError,
@@ -19,11 +22,16 @@ BROKER_URL = os.environ.get(
     "BROKER_URL", "amqp://urban_user:urban_secure_pass@localhost:5672/%2F"
 )
 AUDIT_DATABASE_URL = os.environ.get("AUDIT_DATABASE_URL")
-GENESIS_HASH = "0" * 64
+AUDIT_ARCHIVE_BUCKET = os.environ.get("AUDIT_ARCHIVE_BUCKET")
+AUDIT_OBJECT_LOCK_RETENTION_DAYS = int(
+    os.environ.get("AUDIT_OBJECT_LOCK_RETENTION_DAYS", "2555")
+)
 LOGGER = logging.getLogger("urban-alert-audit")
 AUDIT_EVENT_TYPES = {
     "reporte.creado",
     "reporte.validado",
+    "reporte.rechazado",
+    "reporte.resuelto",
     "obra.asignada",
     "usuario.rol_cambiado",
 }
@@ -35,12 +43,53 @@ def database_connection():
     return psycopg2.connect(AUDIT_DATABASE_URL)
 
 
-def calcular_hash_evento(evento_dict, hash_previo):
-    evento_string = json.dumps(
-        evento_dict, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+def _audit_record(evento, hash_previo, record_hash):
+    return {
+        "eventId": evento["eventId"],
+        "reportId": evento["reportId"],
+        "evento": evento["eventType"],
+        "actorId": evento["data"]["actorId"],
+        "correlationId": evento["correlationId"],
+        "occurredAt": evento["occurredAt"],
+        "hash_anterior": hash_previo,
+        "hash": record_hash,
+        "payload": evento,
+    }
+
+
+def archivar_evento_inmutable(audit_record):
+    if not AUDIT_ARCHIVE_BUCKET:
+        return
+
+    object_key = (
+        f"events/{audit_record['occurredAt'][:10]}/"
+        f"{audit_record['eventId']}.json"
     )
-    contenido = f"{hash_previo}:{evento_string}".encode("utf-8")
-    return hashlib.sha256(contenido).hexdigest()
+    s3 = boto3.client("s3", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+    try:
+        s3.head_object(Bucket=AUDIT_ARCHIVE_BUCKET, Key=object_key)
+        return
+    except ClientError as error:
+        status_code = error.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if status_code != 404:
+            raise
+
+    retention_until = datetime.now(timezone.utc) + timedelta(
+        days=AUDIT_OBJECT_LOCK_RETENTION_DAYS
+    )
+    archive = {
+        "event": audit_record["payload"],
+        "previousHash": audit_record["hash_anterior"],
+        "hash": audit_record["hash"],
+    }
+    s3.put_object(
+        Bucket=AUDIT_ARCHIVE_BUCKET,
+        Key=object_key,
+        Body=json.dumps(archive, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        ContentType="application/json",
+        ObjectLockMode="COMPLIANCE",
+        ObjectLockRetainUntilDate=retention_until,
+    )
 
 
 def persistir_evento_auditoria(evento):
@@ -57,11 +106,20 @@ def persistir_evento_auditoria(evento):
                 hash_previo = chain_state[0]
 
                 cursor.execute(
-                    "SELECT event_id FROM audit_events WHERE event_id = %s",
+                    """
+                    SELECT payload, previous_hash, record_hash
+                    FROM audit_events WHERE event_id = %s
+                    """,
                     (evento["eventId"],),
                 )
-                if cursor.fetchone() is not None:
-                    return None
+                existing = cursor.fetchone()
+                if existing is not None:
+                    payload = existing[0]
+                    if isinstance(payload, str):
+                        payload = json.loads(payload)
+                    return _audit_record(
+                        payload, existing[1].strip(), existing[2].strip()
+                    )
 
                 record_hash = calcular_hash_evento(evento, hash_previo)
                 cursor.execute(
@@ -89,16 +147,7 @@ def persistir_evento_auditoria(evento):
                     "UPDATE audit_chain_state SET last_hash = %s, last_event_id = %s WHERE singleton = TRUE",
                     (record_hash, evento["eventId"]),
                 )
-                return {
-                    "eventId": evento["eventId"],
-                    "reportId": evento["reportId"],
-                    "evento": evento["eventType"],
-                    "actorId": evento["data"]["actorId"],
-                    "correlationId": evento["correlationId"],
-                    "occurredAt": evento["occurredAt"],
-                    "hash_anterior": hash_previo,
-                    "hash": record_hash,
-                }
+                return _audit_record(evento, hash_previo, record_hash)
     finally:
         connection.close()
 
@@ -129,9 +178,7 @@ def callback_auditoria(ch, method, properties, body):
 
     try:
         nuevo_bloque = persistir_evento_auditoria(evento_origen)
-        if nuevo_bloque is None:
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-            return
+        archivar_evento_inmutable(nuevo_bloque)
 
         # Structured Logging obligatorio (Factor XI - stdout)
         LOGGER.info(json.dumps({"log_level": "INFO", "audit_record": nuevo_bloque}))

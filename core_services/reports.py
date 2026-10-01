@@ -31,7 +31,16 @@ from core_services.storage import (
 reports = Blueprint("reports", __name__)
 LOGGER = logging.getLogger(__name__)
 VALID_CATEGORIES = {"hueco_via", "fuga_agua", "alumbrado", "arbolado", "otro"}
-VALID_TRANSITIONS = {"RECIBIDO": {"VALIDADO"}}
+VALID_TRANSITIONS = {
+    "RECIBIDO": {"VALIDADO", "RECHAZADO"},
+    "VALIDADO": {"RECHAZADO"},
+    "EN_OBRA": {"RESUELTO"},
+}
+TRANSITION_EVENT_TYPES = {
+    "VALIDADO": "reporte.validado",
+    "RECHAZADO": "reporte.rechazado",
+    "RESUELTO": "reporte.resuelto",
+}
 
 
 def _report_dict(row):
@@ -287,10 +296,8 @@ def transition_report(report_id):
     body = require_json_object()
     new_status = body.get("estado")
     reason = body.get("motivo", "")
-    if new_status == "RECHAZADO":
-        raise ApiError(409, "CONTRACT_NOT_DEFINED", "Falta aprobar el contrato para reporte.rechazado.")
-    if new_status != "VALIDADO":
-        raise ApiError(400, "VALIDATION_ERROR", "estado debe ser VALIDADO.")
+    if new_status not in TRANSITION_EVENT_TYPES:
+        raise ApiError(400, "VALIDATION_ERROR", "estado no es una transición soportada.")
     if not isinstance(reason, str):
         raise ApiError(400, "VALIDATION_ERROR", "motivo debe ser texto.")
 
@@ -325,20 +332,19 @@ def transition_report(report_id):
                     """,
                     (report_id, report["estado"], new_status, actor_id, reason or None),
                 )
-                if new_status == "VALIDADO":
-                    event = create_event(
-                        "reporte.validado",
-                        report_id,
-                        correlation_id,
-                        {
-                            "actorId": actor_id,
-                            "municipioId": str(report["municipio_id"]),
-                            "estadoPrevio": "RECIBIDO",
-                            "estadoNuevo": "VALIDADO",
-                            **({"motivo": reason} if reason else {}),
-                        },
-                    )
-                    enqueue_event(cursor, event)
+                event = create_event(
+                    TRANSITION_EVENT_TYPES[new_status],
+                    report_id,
+                    correlation_id,
+                    {
+                        "actorId": actor_id,
+                        "municipioId": str(report["municipio_id"]),
+                        "estadoPrevio": report["estado"],
+                        "estadoNuevo": new_status,
+                        **({"motivo": reason} if reason else {}),
+                    },
+                )
+                enqueue_event(cursor, event)
                 return {"report": _report_dict(updated)}
     finally:
         connection.close()

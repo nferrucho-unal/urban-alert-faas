@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://urban-alert.local/schemas/reporte.resuelto.v1.schema.json",
+  "title": "reporte.resuelto v1",
+  "description": "Publicado por ServicioReportes al resolver un reporte EN_OBRA. Consumido por Auditoría y Notificaciones.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["eventId", "eventType", "version", "occurredAt", "correlationId", "reportId", "data"],
+  "properties": {
+    "eventId": { "type": "string", "format": "uuid" },
+    "eventType": { "const": "reporte.resuelto" },
+    "version": { "const": 1 },
+    "occurredAt": { "type": "string", "format": "date-time" },
+    "correlationId": { "type": "string", "format": "uuid" },
+    "reportId": { "type": "string", "format": "uuid" },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actorId", "municipioId", "estadoPrevio", "estadoNuevo"],
+      "properties": {
+        "actorId": { "type": "string", "format": "uuid" },
+        "municipioId": { "type": "string", "format": "uuid" },
+        "estadoPrevio": { "const": "EN_OBRA" },
+        "estadoNuevo": { "const": "RESUELTO" },
+        "motivo": { "type": "string", "maxLength": 500 }
+      }
+    }
+  }
+}

@@ -78,13 +78,38 @@ Puertos locales principales:
 Compose aplica `core_init/002_business_services.sql` y
 `postgis_init/002_reportes_geo.sql` con tareas idempotentes antes de iniciar
 las APIs. No es necesario borrar los volúmenes para actualizar el esquema.
-Auditoría conserva los eventos en `audit_db`, PostgreSQL dedicada con volumen
-persistente `audit_data`. `audit_events` es append-only, deduplica por `eventId`
-y mantiene la cadena de hashes aunque el consumidor se reinicie.
 Auditoría conserva sus eventos en PostgreSQL dedicado (`audit_db`) sobre el
-volumen `audit_data`; la tabla `audit_events` no permite UPDATE/DELETE y el rol
-del consumidor solo tiene SELECT/INSERT. El hash chain y la deduplicación por
-`eventId` persisten entre reinicios.
+volumen `audit_data`. `audit_events` es append-only y deduplica por `eventId`;
+un trigger impide UPDATE/DELETE. El consumidor usa `audit_writer` (SELECT e
+INSERT, sin mutación de eventos) y la API usa `audit_reader` (solo SELECT).
+`audit_migrate` crea ambos roles e índices por reporte/secuencia y correlación.
+La cadena SHA-256 se actualiza dentro de la transacción que inserta cada evento.
+
+### Consulta e integridad de auditoría
+
+- `GET /auditoria/reportes/{reportId}?limit=100&cursor=0` devuelve el historial
+	ordenado por secuencia y una página de hasta 500 eventos. El `cursor` de la
+	respuesta se envía en la siguiente petición. Ciudadanos solo consultan sus
+	propios reportes; gestores, los de su municipio; administradores pueden
+	consultar cualquier reporte.
+- `GET /auditoria/reportes/{reportId}/integridad` recalcula la cadena completa
+	y compara el último hash con `audit_chain_state`. Solo está disponible para
+	gestores y administradores. `verified=false` indica una secuencia corrupta o
+	un head que no coincide.
+- Se almacenan los envelopes completos de `reporte.creado`, `reporte.validado`,
+	`reporte.rechazado`, `reporte.resuelto`, `obra.asignada` y
+	`usuario.rol_cambiado`, incluyendo su `data` original.
+
+El consumidor puede archivar cada evento en S3 antes de confirmar el mensaje.
+En producción, configura `AUDIT_ARCHIVE_BUCKET` y credenciales AWS mediante el
+rol del runtime; Terraform crea un bucket versionado con Object Lock en modo
+`COMPLIANCE` y retención predeterminada de 2555 días, más un rol IAM escritor.
+Los outputs `urban_alert_audit_archive_bucket` y
+`urban_alert_audit_archive_role_arn` identifican esos recursos. Sin
+`AUDIT_ARCHIVE_BUCKET`, el archivo remoto queda desactivado, como corresponde
+en Compose local. El Terraform actual provisiona el bucket y el rol pero no
+despliega `fn_audit` como Lambda: el despliegue de producción debe asociar el rol
+al runtime y proporcionar el nombre del bucket antes de habilitar el archivo.
 
 ### Servicios de negocio
 
@@ -93,8 +118,10 @@ del consumidor solo tiene SELECT/INSERT. El hash chain y la deduplicación por
 	`reporte.creado` en outbox.
 - `GET /reportes/{uuid}` y `GET /reportes?...`: consulta/lista; el bbox se
 	delega al Servicio Geoespacial.
-- `PATCH /reportes/{uuid}/estado`: permite `RECIBIDO -> VALIDADO` y genera
-	`reporte.validado` en outbox.
+- `PATCH /reportes/{uuid}/estado`: permite las transiciones
+	`RECIBIDO -> VALIDADO`, `RECIBIDO -> RECHAZADO`,
+	`VALIDADO -> RECHAZADO` y `EN_OBRA -> RESUELTO`; cada transición publica el
+	evento versionado correspondiente en outbox dentro de la misma transacción.
 - `GET|PUT /usuarios/me`: consulta/actualiza el perfil ciudadano; no permite
 	autoasignar roles.
 - `PATCH /usuarios/{uuid}/rol`: admin cambia un rol y produce
@@ -141,10 +168,6 @@ Guárdalo en el almacén de secretos del CI para despliegues repetibles y rótal
 coordinando un nuevo `terraform apply`; el stage de API Gateway se redepliega al
 cambiar el mapping.
 
-`PATCH estado=RECHAZADO` responde `409 CONTRACT_NOT_DEFINED`: falta aprobar un
-esquema para `reporte.rechazado`. No se persiste una transición que no pueda
-auditarse por evento.
-
 Para detener los contenedores y la red del proyecto:
 
 ```powershell
@@ -183,6 +206,8 @@ Con los servicios levantados y el entorno virtual activo, ejecuta los scripts de
 python .\validar\validar_contratos.py
 python .\scripts_test\test_auth_boundary.py
 python .\scripts_test\test_audit_persistence.py
+python .\scripts_test\test_audit_api.py
+python .\scripts_test\test_audit_persistence_db.py
 python .\scripts_test\test_contract_consumers.py
 python .\scripts_test\test_business_producers.py
 python .\scripts_test\test_multimedia_flow.py
@@ -199,6 +224,8 @@ Cada script valida un comportamiento distinto:
 - `validar_contratos.py`: valida los ejemplos contra los esquemas versionados.
 - `test_auth_boundary.py`: verifica JWT RS256, issuer/cliente/expiración, secreto Gateway y rol vigente en DB.
 - `test_audit_persistence.py`: verifica persistencia append-only, hash chain, reentrega idempotente y requeue ante fallo DB.
+- `test_audit_api.py`: valida autorización por propietario/municipio, paginación del historial y detección de corrupción de hash.
+- `test_audit_persistence_db.py`: prueba integración del event store contra PostgreSQL; requiere `audit_db` y `audit_migrate` activos.
 - `test_contract_consumers.py`: verifica validación, DLQ y versiones desconocidas en los consumidores.
 - `test_business_producers.py`: valida contratos de productores, RBAC básico, validación de entradas y relay outbox.
 - `test_multimedia_flow.py`: verifica firma de carga, HEAD/metadata, promoción a clave final y URL de descarga.

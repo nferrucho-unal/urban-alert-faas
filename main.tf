@@ -75,6 +75,75 @@ resource "aws_s3_bucket" "multimedia" {
   bucket = "urban-alert-evidencias-${data.aws_caller_identity.current.account_id}-${var.aws_region}"
 }
 
+resource "aws_s3_bucket" "audit_archive" {
+  bucket              = "urban-alert-audit-${data.aws_caller_identity.current.account_id}-${var.aws_region}"
+  object_lock_enabled = true
+}
+
+resource "aws_s3_bucket_public_access_block" "audit_archive" {
+  bucket                  = aws_s3_bucket.audit_archive.id
+  block_public_acls       = true
+  ignore_public_acls      = true
+  block_public_policy     = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "audit_archive" {
+  bucket = aws_s3_bucket.audit_archive.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_versioning" "audit_archive" {
+  bucket = aws_s3_bucket.audit_archive.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_object_lock_configuration" "audit_archive" {
+  bucket = aws_s3_bucket.audit_archive.id
+  rule {
+    default_retention {
+      mode = "COMPLIANCE"
+      days = 2555
+    }
+  }
+}
+
+resource "aws_iam_role" "audit_archive_writer" {
+  name = "urban-alert-audit-archive-writer"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "audit_archive_write" {
+  name = "urban-alert-audit-object-lock-write"
+  role = aws_iam_role.audit_archive_writer.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = ["s3:GetObject", "s3:PutObject", "s3:PutObjectRetention"]
+      Resource = "${aws_s3_bucket.audit_archive.arn}/events/*"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "audit_archive_logs" {
+  role       = aws_iam_role.audit_archive_writer.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
 resource "aws_s3_bucket_public_access_block" "multimedia" {
   bucket                  = aws_s3_bucket.multimedia.id
   block_public_acls       = true
@@ -445,4 +514,12 @@ output "urban_alert_cognito_client_id" {
 
 output "urban_alert_multimedia_bucket" {
   value = aws_s3_bucket.multimedia.bucket
+}
+
+output "urban_alert_audit_archive_bucket" {
+  value = aws_s3_bucket.audit_archive.bucket
+}
+
+output "urban_alert_audit_archive_role_arn" {
+  value = aws_iam_role.audit_archive_writer.arn
 }
